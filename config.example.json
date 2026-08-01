@@ -1,0 +1,9 @@
+{
+  "cookie": "web_uid=xxxx; account_corp_id=xxxx; we_meet_token=xxxx",
+  "output_dir": "./downloads",
+  "download_video": true,
+  "download_audio": false,
+  "export_transcript": true,
+  "transcript_formats": ["md", "txt", "json", "srt"],
+  "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+}
