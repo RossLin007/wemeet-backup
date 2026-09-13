@@ -5,6 +5,9 @@ config.json
 downloads/
 meetings.txt
 
+# 本地核对报告（含个人会议标题与回放链接，勿提交）
+有视频的会议记录.md
+
 # Python 编译缓存与虚拟环境
 __pycache__/
 *.pyc

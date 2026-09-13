@@ -153,10 +153,16 @@ class TencentMeetingClient:
         """
         Automatically traverses all pages in user account and returns standardized meeting dicts.
         Includes video detection and shared-record-middle link parsing.
+
+        始终完整翻页：列表按新→旧排序，但"整页已完成即提前停止"并不可靠——
+        历史上任意一整页已完成记录都会挡住更早的未完成记录（如视频下载中断的旧记录），
+        使增量模式永远补不上。翻页只是轻量 API 调用，真正的去重开销由调用方
+        依据增量状态清单逐条跳过已完成记录来承担。
         """
         all_meetings = []
         page_index = 1
-        page_size = 20
+        # 网页端单页上限为 30 条（10/20/30 可选），取满以减少翻页请求数
+        page_size = 30
 
         while True:
             try:
@@ -165,6 +171,7 @@ class TencentMeetingClient:
                 if not records:
                     break
 
+                page_items = []
                 for r in records:
                     m_info = r.get("meeting_info", {})
                     m_id = str(m_info.get("meeting_id") or "")
@@ -186,17 +193,20 @@ class TencentMeetingClient:
                     has_video = rec_type in ["cloud_record", "fast_record", "user_upload"] or is_middle
 
                     if m_id or rec_id or share_id:
-                        all_meetings.append({
+                        page_items.append({
                             "meeting_id": m_id,
                             "recording_id": rec_id,
                             "detail_id": uuid_id,
                             "share_id": share_id,
+                            "uni_record_id": uni_id,
                             "topic": title,
                             "record_type": rec_type,
                             "has_video": has_video,
                             "is_shared_middle": is_middle,
                             "jump_path": jump_path
                         })
+
+                all_meetings.extend(page_items)
 
                 if len(records) < page_size:
                     break
@@ -287,4 +297,41 @@ class TencentMeetingClient:
             "meeting_id": str(meeting_info.get("meeting_id") or ""),
             "sub_items": sub_items
         }
+
+    def get_download_links(self, uni_record_id: str) -> Dict[str, Dict[str, str]]:
+        """
+        解析录制记录的媒体下载直链（网页端"另存为"菜单的同源接口）。
+        API: /wemeet-cloudrecording-webapi/v1/download/meeting
+
+        id 为顶层记录的 uni_record_id；返回的每条 link 同时携带视频直链
+        (link, .mp4) 与纯音频直链 (audio_link, .m4a)，均为带 token 的
+        COS 地址，可直接流式下载并支持 Range 断点续传。
+
+        返回按资源 ID（COS 路径第三段，与子记录/单记录的 recording_id
+        同口径，即 uni_record_id + 1 及各分组讨论资源 ID）索引的字典：
+        {resource_id: {"video_url": ..., "audio_url": ...}}
+        """
+        endpoint = "/wemeet-cloudrecording-webapi/v1/download/meeting"
+        params = {
+            "id": uni_record_id,
+            "pwd": "",
+            "source": "owner",
+            "activity_uid": "",
+            "tk": "",
+            "need_multi_stream": "0",
+            "from_share": "1",
+            "enter_from": "share"
+        }
+        res = self._get(endpoint, params)
+        media: Dict[str, Dict[str, str]] = {}
+        for link in res.get("links") or []:
+            url = link.get("link") or link.get("audio_link") or ""
+            m = re.search(r"/cos/\d+/(\d+)/(\d+)/", url)
+            if not m:
+                continue
+            media[m.group(2)] = {
+                "video_url": link.get("link") or "",
+                "audio_url": link.get("audio_link") or ""
+            }
+        return media
 
