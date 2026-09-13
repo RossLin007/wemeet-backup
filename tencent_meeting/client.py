@@ -15,6 +15,8 @@ except ImportError:
     import urllib.request
     HAS_REQUESTS = False
 
+from tencent_meeting.state import record_identifier
+
 
 def generate_nonce(length: int = 9) -> str:
     """Generates a random string for API nonce."""
@@ -149,10 +151,13 @@ class TencentMeetingClient:
         }
         return self._post(endpoint, payload)
 
-    def get_all_user_meetings(self) -> List[Dict[str, Any]]:
+    def get_all_user_meetings(self, known_identifiers: Optional[set] = None) -> List[Dict[str, Any]]:
         """
         Automatically traverses all pages in user account and returns standardized meeting dicts.
         Includes video detection and shared-record-middle link parsing.
+
+        增量模式：传入 known_identifiers（已登记过的记录标识符集合）后，
+        列表按新→旧排序，一旦某一整页记录全部已登记，即可提前停止翻页。
         """
         all_meetings = []
         page_index = 1
@@ -165,6 +170,7 @@ class TencentMeetingClient:
                 if not records:
                     break
 
+                page_items = []
                 for r in records:
                     m_info = r.get("meeting_info", {})
                     m_id = str(m_info.get("meeting_id") or "")
@@ -186,7 +192,7 @@ class TencentMeetingClient:
                     has_video = rec_type in ["cloud_record", "fast_record", "user_upload"] or is_middle
 
                     if m_id or rec_id or share_id:
-                        all_meetings.append({
+                        page_items.append({
                             "meeting_id": m_id,
                             "recording_id": rec_id,
                             "detail_id": uuid_id,
@@ -197,6 +203,20 @@ class TencentMeetingClient:
                             "is_shared_middle": is_middle,
                             "jump_path": jump_path
                         })
+
+                all_meetings.extend(page_items)
+
+                if known_identifiers is not None and page_items and all(
+                    record_identifier(
+                        detail_id=it["detail_id"],
+                        recording_id=it["recording_id"],
+                        share_id=it["share_id"],
+                        meeting_id=it["meeting_id"]
+                    ) in known_identifiers
+                    for it in page_items
+                ):
+                    print(f"[增量模式] 第 {page_index} 页记录均已登记过，提前停止遍历列表。")
+                    break
 
                 if len(records) < page_size:
                     break

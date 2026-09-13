@@ -11,10 +11,18 @@ except ImportError:
     HAS_REQUESTS = False
 
 
-def download_file(url: str, dest_path: str, headers: Optional[Dict[str, str]] = None, overwrite: bool = True) -> bool:
+def _format_size(num_bytes: float) -> str:
+    return f"{num_bytes / 1024 / 1024:.2f} MB"
+
+
+def download_file(url: str, dest_path: str, headers: Optional[Dict[str, str]] = None,
+                  overwrite: bool = True, max_retries: int = 5) -> bool:
     """
-    Streamed chunked downloader with progress bar and speed display.
-    Supports resuming or skipping existing non-empty files.
+    Streamed chunked downloader with progress and speed display.
+
+    支持断点续传：下载中断（网络停滞/连接重置）时保留 .tmp 已下载部分，
+    自动携带 Range 头从断点处继续，最多重试 max_retries 次；重试耗尽仍失败时
+    保留 .tmp，下次运行自动续传，避免大文件前功尽弃。
     """
     if not url:
         print(f"[跳过下载] URL 为空: {dest_path}")
@@ -37,77 +45,90 @@ def download_file(url: str, dest_path: str, headers: Optional[Dict[str, str]] = 
 
     print(f"\n[开始下载] -> {dest_path}")
 
-    try:
-        if HAS_REQUESTS:
-            with requests.get(url, headers=default_headers, stream=True, timeout=30) as r:
-                r.raise_for_status()
-                total_size = int(r.headers.get("content-length", 0))
-                downloaded = 0
-                start_time = time.time()
+    for attempt in range(max_retries + 1):
+        resume_from = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
+        if resume_from > 0:
+            print(f"  [断点续传] 从已下载的 {_format_size(resume_from)} 处继续...")
 
-                with open(temp_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=1024 * 1024):
-                        if chunk:
+        try:
+            req_headers = dict(default_headers)
+            if resume_from > 0:
+                req_headers["Range"] = f"bytes={resume_from}-"
+
+            downloaded = 0
+            start_time = time.time()
+
+            def _print_progress() -> None:
+                elapsed = time.time() - start_time
+                speed = (downloaded / 1024 / 1024) / elapsed if elapsed > 0 else 0
+                done = resume_from + downloaded
+                if total_size > 0:
+                    percent = (done / total_size) * 100
+                    sys.stdout.write(
+                        f"\r  已下载: {_format_size(done)} / {_format_size(total_size)} "
+                        f"({percent:.1f}%) | 速度: {speed:.2f} MB/s"
+                    )
+                else:
+                    sys.stdout.write(f"\r  已下载: {_format_size(done)} | 速度: {speed:.2f} MB/s")
+                sys.stdout.flush()
+
+            if HAS_REQUESTS:
+                with requests.get(url, headers=req_headers, stream=True, timeout=30) as r:
+                    r.raise_for_status()
+                    if resume_from > 0 and r.status_code != 206:
+                        # 服务端忽略 Range 返回了完整文件，从头写入
+                        resume_from = 0
+                    total_size = resume_from + int(r.headers.get("content-length", 0))
+
+                    with open(temp_path, "ab" if resume_from > 0 else "wb") as f:
+                        for chunk in r.iter_content(chunk_size=1024 * 1024):
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                _print_progress()
+            else:
+                req = urllib.request.Request(url, headers=req_headers)
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    status = getattr(resp, "status", None) or resp.getcode()
+                    if resume_from > 0 and status != 206:
+                        # 服务端忽略 Range 返回了完整文件，从头写入
+                        resume_from = 0
+                    total_size = resume_from + int(resp.headers.get("content-length", 0))
+
+                    with open(temp_path, "ab" if resume_from > 0 else "wb") as f:
+                        while True:
+                            chunk = resp.read(1024 * 1024)
+                            if not chunk:
+                                break
                             f.write(chunk)
                             downloaded += len(chunk)
-                            elapsed = time.time() - start_time
-                            speed = (downloaded / 1024 / 1024) / elapsed if elapsed > 0 else 0
+                            _print_progress()
 
-                            if total_size > 0:
-                                percent = (downloaded / total_size) * 100
-                                sys.stdout.write(
-                                    f"\r  已下载: {downloaded / 1024 / 1024:.2f} MB / {total_size / 1024 / 1024:.2f} MB "
-                                    f"({percent:.1f}%) | 速度: {speed:.2f} MB/s"
-                                )
-                            else:
-                                sys.stdout.write(f"\r  已下载: {downloaded / 1024 / 1024:.2f} MB | 速度: {speed:.2f} MB/s")
-                            sys.stdout.flush()
+            sys.stdout.write("\n")
+            if os.path.exists(temp_path):
+                if os.path.exists(dest_path):
+                    os.remove(dest_path)
+                os.rename(temp_path, dest_path)
+                print(f"[下载完成] -> {dest_path}")
+                return True
+            return False
 
-                sys.stdout.write("\n")
-        else:
-            req = urllib.request.Request(url, headers=default_headers)
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                total_size = int(resp.headers.get("content-length", 0))
-                downloaded = 0
-                start_time = time.time()
-
-                with open(temp_path, "wb") as f:
-                    while True:
-                        chunk = resp.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        elapsed = time.time() - start_time
-                        speed = (downloaded / 1024 / 1024) / elapsed if elapsed > 0 else 0
-
-                        if total_size > 0:
-                            percent = (downloaded / total_size) * 100
-                            sys.stdout.write(
-                                f"\r  已下载: {downloaded / 1024 / 1024:.2f} MB / {total_size / 1024 / 1024:.2f} MB "
-                                f"({percent:.1f}%) | 速度: {speed:.2f} MB/s"
-                            )
-                        else:
-                            sys.stdout.write(f"\r  已下载: {downloaded / 1024 / 1024:.2f} MB | 速度: {speed:.2f} MB/s")
-                        sys.stdout.flush()
-
-                sys.stdout.write("\n")
-
-        # Rename temp_path to dest_path
-        if os.path.exists(temp_path):
-            if os.path.exists(dest_path):
-                os.remove(dest_path)
-            os.rename(temp_path, dest_path)
-            print(f"[下载完成] -> {dest_path}")
-            return True
-
-    except Exception as e:
-        print(f"\n[下载失败] {dest_path}: {e}")
-        if os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass
-        return False
+        except Exception as e:
+            sys.stdout.write("\n")
+            saved = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
+            if attempt < max_retries and saved > 0:
+                print(f"[下载中断] {e}；已保留 {_format_size(saved)}，第 {attempt + 1}/{max_retries} 次断点续传重试...")
+                time.sleep(2)
+                continue
+            if saved > 0:
+                print(f"[下载失败] {dest_path}: {e}；已保留 {_format_size(saved)} 临时文件，下次运行将自动续传。")
+            else:
+                print(f"[下载失败] {dest_path}: {e}")
+                if os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except Exception:
+                        pass
+            return False
 
     return False
