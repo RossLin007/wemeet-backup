@@ -30,6 +30,7 @@ from tencent_meeting.state import (
     save_state,
     touch
 )
+from tencent_meeting.cleaner import run_cleaner
 
 
 def sanitize_filename(name: str) -> str:
@@ -391,7 +392,16 @@ def main():
     parser.add_argument("--no-audio", action="store_true", help="跳过下载音频")
     parser.add_argument("--no-transcript", action="store_true", help="跳过导出转写记录")
     parser.add_argument("--full", action="store_true", help="忽略增量状态强制全量备份（重试失败记录、重新展开合集）")
+    parser.add_argument("--clean", action="store_true", help="清理模式：核对本地备份后，列出可安全删除的线上有视频记录（默认干跑不删除）")
+    parser.add_argument("--apply", action="store_true", help="配合 --clean 真正执行线上删除（不可恢复，本地备份保留）")
+    parser.add_argument("--yes", action="store_true", help="配合 --clean --apply 跳过交互确认（脚本化场景）")
+    parser.add_argument("--limit", type=int, help="配合 --clean --apply：本次最多删除 N 条（建议首删用 --limit 1 验证）")
     args = parser.parse_args()
+
+    if args.apply and not args.clean:
+        parser.error("--apply 仅在 --clean 清理模式下有效")
+    if args.clean and (args.file or args.meeting_id or args.recording_id or args.share_id):
+        parser.error("--clean 清理模式基于账号全量列表核对，不支持 -f/--meeting-id/--recording-id/--share-id")
 
     # Load configuration
     cfg = load_config(args.config)
@@ -426,6 +436,20 @@ def main():
     save_state(output_dir, state)
 
     client = TencentMeetingClient(cookie_str=cookie_str, user_agent=user_agent)
+
+    # 清理模式：只核对与删除，不下载（无需解析媒体直链），在备份调度前短路
+    if args.clean:
+        sys.exit(run_cleaner(
+            client=client,
+            state=state,
+            output_dir=output_dir,
+            formats=formats,
+            need_transcript=export_transcript,
+            need_audio=download_audio,
+            apply=args.apply,
+            assume_yes=args.yes,
+            limit=args.limit,
+        ))
 
     raw_items = []
 

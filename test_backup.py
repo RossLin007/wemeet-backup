@@ -450,6 +450,198 @@ class TestDownloaderResume(unittest.TestCase):
             server.shutdown()
 
 
+class _FakeCleanClient:
+    """Stub of TencentMeetingClient for cleaner tests."""
+
+    def __init__(self, items, subs=None, fail_delete=False):
+        self._items = items
+        self._subs = subs or []
+        self.deleted = []  # 每次 delete_record 的 uni_record_ids 参数
+        self.fail_delete = fail_delete
+
+    def get_all_user_meetings(self):
+        return self._items
+
+    def get_shared_record_middle_list(self, share_id):
+        return {"topic": "合集主题", "meeting_id": "", "sub_items": self._subs}
+
+    def delete_record(self, uni_record_ids):
+        self.deleted.append(list(uni_record_ids))
+        if self.fail_delete:
+            raise RuntimeError("cookie expired")
+        return {"code": 0}
+
+
+class TestCleaner(unittest.TestCase):
+    """清理模式：只删「线上有视频 + 状态完成 + 本地实物齐备」的记录，默认干跑。"""
+
+    FORMATS = ["md"]
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.out = self._tmp.name
+        self.addCleanup(self._tmp.cleanup)
+
+    def _backup_dir(self, ident, topic="主题", with_video=True, with_transcript=True):
+        d = os.path.join(self.out, f"{topic}_{ident}")
+        os.makedirs(d, exist_ok=True)
+        if with_video:
+            with open(os.path.join(d, f"video_{ident}.mp4"), "wb") as f:
+                f.write(b"x" * 16)
+        if with_transcript:
+            for fmt in self.FORMATS:
+                with open(os.path.join(d, f"transcript_{ident}.{fmt}"), "wb") as f:
+                    f.write(b"t")
+        return d
+
+    @staticmethod
+    def _done_entry(topic="主题"):
+        entry = new_entry(topic)
+        entry["transcript_done"] = True
+        entry["video"] = VIDEO_DONE
+        entry["audio"] = AUDIO_DONE
+        return entry
+
+    def _item(self, ident, uni="9001", **over):
+        item = {"meeting_id": "m1", "recording_id": "9002", "detail_id": ident,
+                "share_id": "", "uni_record_id": uni, "topic": "主题" + ident,
+                "record_type": "cloud_record", "has_video": True,
+                "is_shared_middle": False, "jump_path": "",
+                "allow_delete": True, "cloud_size": 1000}
+        item.update(over)
+        return item
+
+    def _state(self, *idents):
+        return {"records": {i: self._done_entry() for i in idents}}
+
+    def test_selects_fully_backed_video_record(self):
+        from tencent_meeting.cleaner import select_deletable
+        self._backup_dir("id1")
+        self._backup_dir("id2")
+        client = _FakeCleanClient([self._item("id1", uni="9001"),
+                                   self._item("id2", uni="1000")])
+        deletable, skipped = select_deletable(client, self._state("id1", "id2"), self.out, self.FORMATS)
+        self.assertEqual(len(deletable), 2)
+        self.assertEqual(skipped, [])
+        # 旧记录（uni 小）排在前面，--limit 截断时优先删最旧的
+        self.assertEqual([d["uni_record_id"] for d in deletable], ["1000", "9001"])
+
+    def test_skips_when_local_video_missing(self):
+        from tencent_meeting.cleaner import select_deletable
+        self._backup_dir("id1", with_video=False)  # 状态完成但视频文件不在盘
+        client = _FakeCleanClient([self._item("id1")])
+        deletable, skipped = select_deletable(client, self._state("id1"), self.out, self.FORMATS)
+        self.assertEqual(deletable, [])
+        self.assertIn("本地视频文件缺失", skipped[0]["reason"])
+
+    def test_skips_when_state_incomplete_or_ambiguous_dir(self):
+        from tencent_meeting.cleaner import select_deletable
+        # 状态缺失
+        self._backup_dir("id1")
+        client = _FakeCleanClient([self._item("id1")])
+        deletable, skipped = select_deletable(client, self._state(), self.out, self.FORMATS)
+        self.assertEqual(deletable, [])
+        self.assertIn("备份状态未完成", skipped[0]["reason"])
+        # 同一标识符有两个候选目录 → 无法唯一定位，跳过
+        self._backup_dir("id2", topic="a")
+        self._backup_dir("id2", topic="b")
+        client = _FakeCleanClient([self._item("id2")])
+        deletable, skipped = select_deletable(client, self._state("id2"), self.out, self.FORMATS)
+        self.assertEqual(deletable, [])
+        self.assertIn("无法唯一定位", skipped[0]["reason"])
+
+    def test_ignores_no_video_and_allow_delete_false(self):
+        from tencent_meeting.cleaner import select_deletable
+        self._backup_dir("id1")
+        self._backup_dir("id2")
+        client = _FakeCleanClient([
+            self._item("id1", has_video=False),
+            self._item("id2", allow_delete=False),
+        ])
+        deletable, skipped = select_deletable(client, self._state("id1", "id2"), self.out, self.FORMATS)
+        self.assertEqual(deletable, [])  # 无视频记录连跳过清单都不进
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("allow_delete", skipped[0]["reason"])
+
+    def test_container_requires_all_subs_backed_up(self):
+        from tencent_meeting.cleaner import select_deletable
+        parent = self._item("", uni="9005", detail_id="", share_id="parentS",
+                            is_shared_middle=True, topic="合集",
+                            recording_id="", meeting_id="")
+        subs = [{"meeting_id": "", "recording_id": "r1", "detail_id": "d1",
+                 "share_id": "sh-d1", "topic": "子1"},
+                {"meeting_id": "", "recording_id": "r2", "detail_id": "d2",
+                 "share_id": "sh-d2", "topic": "子2"}]
+        self._backup_dir("d1")
+        self._backup_dir("d2", with_video=False)  # 子2 视频缺失
+        state = self._state("d1", "d2", "parentS")
+        client = _FakeCleanClient([parent], subs=subs)
+        deletable, skipped = select_deletable(client, state, self.out, self.FORMATS)
+        self.assertEqual(deletable, [])
+        self.assertIn("子记录备份不齐", skipped[0]["reason"])
+
+        # 补齐子2 视频后整个合集可删
+        with open(os.path.join(self.out, "主题_d2", "video_d2.mp4"), "wb") as f:
+            f.write(b"x" * 16)
+        deletable, skipped = select_deletable(client, state, self.out, self.FORMATS)
+        self.assertEqual(len(deletable), 1)
+        self.assertTrue(deletable[0]["is_container"])
+        self.assertEqual(deletable[0]["sub_identifiers"], ["d1", "d2"])
+
+    def test_dry_run_never_deletes(self):
+        from tencent_meeting.cleaner import run_cleaner, DELETION_LOG_FILENAME
+        self._backup_dir("id1")
+        client = _FakeCleanClient([self._item("id1")])
+        state = self._state("id1")
+        rc = run_cleaner(client, state, self.out, self.FORMATS, apply=False)
+        self.assertEqual(rc, 0)
+        self.assertEqual(client.deleted, [])  # 干跑绝不调用删除
+        self.assertFalse(os.path.exists(os.path.join(self.out, DELETION_LOG_FILENAME)))
+        self.assertNotIn("deleted_online", state["records"]["id1"])
+
+    def test_apply_deletes_marks_state_and_logs(self):
+        from tencent_meeting.cleaner import run_cleaner, DELETION_LOG_FILENAME
+        self._backup_dir("id1")
+        client = _FakeCleanClient([self._item("id1")])
+        state = self._state("id1")
+        rc = run_cleaner(client, state, self.out, self.FORMATS,
+                         apply=True, assume_yes=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(client.deleted, [["9001"]])
+        self.assertTrue(state["records"]["id1"]["deleted_online"])  # 审计标记
+        log_path = os.path.join(self.out, DELETION_LOG_FILENAME)
+        self.assertTrue(os.path.exists(log_path))
+        with open(log_path, "r", encoding="utf-8") as f:
+            entry = json.loads(f.read().strip())
+        self.assertEqual(entry["uni_record_id"], "9001")
+        self.assertTrue(entry["ok"])
+        # 本地备份原样保留
+        self.assertTrue(os.path.getsize(os.path.join(self.out, "主题_id1", "video_id1.mp4")) > 0)
+
+    def test_apply_confirm_mismatch_cancels(self):
+        from tencent_meeting.cleaner import run_cleaner
+        self._backup_dir("id1")
+        client = _FakeCleanClient([self._item("id1")])
+        rc = run_cleaner(client, self._state("id1"), self.out, self.FORMATS,
+                         apply=True, prompt=lambda _: "错的输入")
+        self.assertEqual(rc, 0)
+        self.assertEqual(client.deleted, [])
+
+    def test_apply_failure_circuit_breaker(self):
+        from tencent_meeting.cleaner import run_cleaner, DELETION_LOG_FILENAME
+        items = [self._item(f"id{i}", uni=str(9000 + i)) for i in range(1, 5)]
+        for i in range(1, 5):
+            self._backup_dir(f"id{i}")
+        state = self._state(*[f"id{i}" for i in range(1, 5)])
+        client = _FakeCleanClient(items, fail_delete=True)
+        rc = run_cleaner(client, state, self.out, self.FORMATS,
+                         apply=True, assume_yes=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(client.deleted), 3)  # 连续 3 次失败熔断，第 4 条不再尝试
+        for i in range(1, 5):
+            self.assertNotIn("deleted_online", state["records"][f"id{i}"])
+
+
 if __name__ == "__main__":
     unittest.main()
 
