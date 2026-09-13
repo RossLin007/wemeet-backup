@@ -15,8 +15,6 @@ except ImportError:
     import urllib.request
     HAS_REQUESTS = False
 
-from tencent_meeting.state import record_identifier
-
 
 def generate_nonce(length: int = 9) -> str:
     """Generates a random string for API nonce."""
@@ -151,17 +149,20 @@ class TencentMeetingClient:
         }
         return self._post(endpoint, payload)
 
-    def get_all_user_meetings(self, known_identifiers: Optional[set] = None) -> List[Dict[str, Any]]:
+    def get_all_user_meetings(self) -> List[Dict[str, Any]]:
         """
         Automatically traverses all pages in user account and returns standardized meeting dicts.
         Includes video detection and shared-record-middle link parsing.
 
-        增量模式：传入 known_identifiers（已登记过的记录标识符集合）后，
-        列表按新→旧排序，一旦某一整页记录全部已登记，即可提前停止翻页。
+        始终完整翻页：列表按新→旧排序，但"整页已完成即提前停止"并不可靠——
+        历史上任意一整页已完成记录都会挡住更早的未完成记录（如视频下载中断的旧记录），
+        使增量模式永远补不上。翻页只是轻量 API 调用，真正的去重开销由调用方
+        依据增量状态清单逐条跳过已完成记录来承担。
         """
         all_meetings = []
         page_index = 1
-        page_size = 20
+        # 网页端单页上限为 30 条（10/20/30 可选），取满以减少翻页请求数
+        page_size = 30
 
         while True:
             try:
@@ -205,18 +206,6 @@ class TencentMeetingClient:
                         })
 
                 all_meetings.extend(page_items)
-
-                if known_identifiers is not None and page_items and all(
-                    record_identifier(
-                        detail_id=it["detail_id"],
-                        recording_id=it["recording_id"],
-                        share_id=it["share_id"],
-                        meeting_id=it["meeting_id"]
-                    ) in known_identifiers
-                    for it in page_items
-                ):
-                    print(f"[增量模式] 第 {page_index} 页记录均已登记过，提前停止遍历列表。")
-                    break
 
                 if len(records) < page_size:
                     break

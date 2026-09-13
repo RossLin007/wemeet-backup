@@ -331,11 +331,12 @@ def main():
 
     # 3. Default: Automatically traverse and fetch all user meetings from account API!
     if not raw_items:
-        known_identifiers = set(state["records"].keys()) if incremental else None
         if incremental:
-            print(f"[增量模式] 状态清单已加载（{len(known_identifiers)} 条已登记），仅遍历新增记录；--full 可强制全量。")
+            done = sum(1 for entry in state["records"].values() if is_complete(entry))
+            print(f"[增量模式] 状态清单已加载（{done}/{len(state['records'])} 条已完成），"
+                  f"遍历全部记录但跳过已完成项；--full 可强制全量。")
         print("[全自动模式] 正在自动遍历您的腾讯会议账号并获取所有历史会议列表...")
-        raw_items = client.get_all_user_meetings(known_identifiers=known_identifiers)
+        raw_items = client.get_all_user_meetings()
 
     if not raw_items:
         print("[提示] 账号中未检测到录制会议记录，或 Cookie 已过期。")
