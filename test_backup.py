@@ -15,6 +15,9 @@ from tencent_meeting.formatter import (
 )
 from tencent_meeting.downloader import download_file
 from tencent_meeting.state import (
+    AUDIO_DONE,
+    AUDIO_OFF,
+    AUDIO_UNKNOWN,
     VIDEO_DONE,
     VIDEO_SKIPPED,
     VIDEO_UNKNOWN,
@@ -58,6 +61,7 @@ class TestExpandMiddleContainers(unittest.TestCase):
         entry = new_entry(topic)
         entry["transcript_done"] = True
         entry["video"] = VIDEO_DONE
+        entry["audio"] = AUDIO_DONE
         return entry
 
     def test_parent_not_marked_when_some_subs_incomplete(self):
@@ -185,13 +189,26 @@ class TestBackupState(unittest.TestCase):
         self.assertFalse(is_complete(entry))  # 视频状态未知时不视为完成
 
         entry["video"] = VIDEO_DONE
+        self.assertFalse(is_complete(entry))  # 音频未对账（unknown）时不视为完成
+
+        entry["audio"] = AUDIO_UNKNOWN
+        self.assertFalse(is_complete(entry))
+
+        entry["audio"] = AUDIO_DONE
         self.assertTrue(is_complete(entry))
 
         entry["video"] = VIDEO_SKIPPED
-        self.assertTrue(is_complete(entry))  # 纯转写类记录（无视频）视为完成
+        entry["audio"] = AUDIO_OFF
+        self.assertTrue(is_complete(entry))  # 纯转写记录 / 未启用音频下载均视为完成
 
         entry["video"] = "failed"
         self.assertFalse(is_complete(entry))
+
+        # 旧版状态文件无 audio 键：按 unknown 处理，需重新对账
+        legacy = {"transcript_done": True, "video": VIDEO_DONE}
+        self.assertFalse(is_complete(legacy))
+        legacy["audio"] = AUDIO_DONE
+        self.assertTrue(is_complete(legacy))
 
     def test_bootstrap_from_disk(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -208,9 +225,16 @@ class TestBackupState(unittest.TestCase):
             self.assertEqual(entry["video"], VIDEO_UNKNOWN)  # 无视频文件时状态未知，待与 API 对账
             self.assertFalse(is_complete(entry))
 
-            # 补上视频文件后引导结果应为完整
+            # 补上视频文件后音频仍未对账，不视为完整
             with open(os.path.join(folder, f"video_{ident}.mp4"), "wb") as f:
                 f.write(b"video")
+            state = bootstrap_state(tmp)
+            self.assertEqual(state["records"][ident]["video"], VIDEO_DONE)
+            self.assertFalse(is_complete(state["records"][ident]))
+
+            # 再补上音频文件后引导结果应为完整
+            with open(os.path.join(folder, f"audio_{ident}.m4a"), "wb") as f:
+                f.write(b"audio")
             state = bootstrap_state(tmp)
             self.assertTrue(is_complete(state["records"][ident]))
             self.assertEqual(state["records"][ident]["topic"], "测试会议")
@@ -244,10 +268,114 @@ class TestBackupState(unittest.TestCase):
             state = {"records": {"id-1": new_entry("会议A")}}
             state["records"]["id-1"]["transcript_done"] = True
             state["records"]["id-1"]["video"] = VIDEO_SKIPPED
+            state["records"]["id-1"]["audio"] = AUDIO_OFF
             save_state(tmp, state)
             loaded = load_state(tmp)
             self.assertTrue(is_complete(loaded["records"]["id-1"]))
             self.assertTrue(os.path.exists(state_path_for(tmp)))
+
+
+class TestMediaLinks(unittest.TestCase):
+    """媒体直链（download/meeting）解析、分发与状态更新。"""
+
+    class _FakeLinkClient:
+        def __init__(self, media=None, error=False):
+            self.media = media or {}
+            self.error = error
+            self.calls = []
+
+        def get_download_links(self, uni):
+            self.calls.append(uni)
+            if self.error:
+                raise RuntimeError("boom")
+            return self.media
+
+    def test_get_download_links_parsing(self):
+        from unittest.mock import patch
+        from tencent_meeting.client import TencentMeetingClient
+        fake = {"code": 0, "links": [
+            {"link": "https://x/cos/200000001/111/222/a.mp4?token=1",
+             "audio_link": "https://x/cos/200000001/111/222/a.m4a?token=2"},
+            {"link": "https://x/cos/200000001/111/333/b.mp4?token=1",
+             "audio_link": ""},
+        ]}
+        client = TencentMeetingClient("web_uid=u")
+        with patch.object(client, "_get", return_value=fake):
+            media = client.get_download_links("111")
+        self.assertEqual(set(media), {"222", "333"})
+        self.assertTrue(media["222"]["video_url"].endswith("a.mp4?token=1"))
+        self.assertTrue(media["222"]["audio_url"].endswith("a.m4a?token=2"))
+        self.assertEqual(media["333"]["audio_url"], "")  # 无独立音频的录制
+
+    def test_attach_media_links_distribution(self):
+        import main as main_mod
+        media = {"111": {"video_url": "v111", "audio_url": "a111"}}
+        client = self._FakeLinkClient(media)
+        items = [
+            {"topic": "单条", "has_video": True, "uni_record_id": "110",
+             "recording_id": "111", "is_shared_middle": False, "share_id": ""},
+            {"topic": "合集", "has_video": True, "uni_record_id": "9",
+             "recording_id": "10", "is_shared_middle": True, "share_id": "sX"},
+            {"topic": "纯转写", "has_video": False, "uni_record_id": "5", "recording_id": "6"},
+        ]
+        out = main_mod.attach_media_links(client, items)
+        self.assertEqual(client.calls, ["110", "9"])  # 纯转写记录不解析
+        self.assertEqual(out[0]["video_url"], "v111")
+        self.assertEqual(out[0]["audio_url"], "a111")
+        self.assertTrue(out[0]["media_links_ok"])
+        self.assertEqual(out[1]["_media_links"], media)  # 合集挂整份映射待分发
+        self.assertNotIn("_media_links", items[2])
+
+    def test_attach_media_links_failure_keeps_fallback(self):
+        import main as main_mod
+        client = self._FakeLinkClient(error=True)
+        items = [{"topic": "t", "has_video": True, "uni_record_id": "1",
+                  "recording_id": "2", "is_shared_middle": False}]
+        out = main_mod.attach_media_links(client, items)
+        self.assertFalse(out[0]["media_links_ok"])
+        self.assertEqual(out[0].get("video_url", ""), "")
+        self.assertEqual(out[0].get("audio_url", ""), "")
+
+    def test_expand_propagates_links_to_subs(self):
+        import main as main_mod
+        media = {"r-d2": {"video_url": "vd2", "audio_url": "ad2"}}
+        parent = {"meeting_id": "", "recording_id": "", "share_id": "pS", "detail_id": "",
+                  "topic": "合集", "is_shared_middle": True,
+                  "_media_links": media, "media_links_ok": True}
+        subs = [{"meeting_id": "", "recording_id": "r-d1", "detail_id": "d1",
+                 "share_id": "sh-d1", "topic": "s1"},
+                {"meeting_id": "", "recording_id": "r-d2", "detail_id": "d2",
+                 "share_id": "sh-d2", "topic": "s2"}]
+        state = {"records": {}}
+        expanded = main_mod.expand_shared_middle_items(_FakeMiddleClient(subs), [parent], state, incremental=True)
+        by_rid = {e["recording_id"]: e for e in expanded}
+        self.assertEqual(by_rid["r-d2"]["video_url"], "vd2")
+        self.assertEqual(by_rid["r-d2"]["audio_url"], "ad2")
+        self.assertEqual(by_rid["r-d1"].get("video_url", ""), "")  # 无匹配资源保持为空
+        self.assertTrue(by_rid["r-d1"]["media_links_ok"])
+
+    def test_update_record_state_audio_mapping(self):
+        import main as main_mod
+        item = {"topic": "t"}
+        cases = [
+            ("done", "done"), ("exists", "done"), ("skipped", "skipped"),
+            ("failed", "failed"), ("off", AUDIO_OFF),
+        ]
+        for i, (result_audio, expected) in enumerate(cases):
+            state = {"records": {}}
+            main_mod.update_record_state(state, f"i{i}", item,
+                                         {"transcript": "done", "video": "skipped", "audio": result_audio})
+            self.assertEqual(state["records"][f"i{i}"]["audio"], expected)
+
+        # none：直链未解析到，保留原状态（unknown）待重试，且不计失败
+        state = {"records": {"keep": new_entry("t")}}
+        state["records"]["keep"]["transcript_done"] = True
+        state["records"]["keep"]["video"] = VIDEO_SKIPPED
+        state["records"]["keep"]["audio"] = AUDIO_UNKNOWN
+        main_mod.update_record_state(state, "keep", item,
+                                     {"transcript": "done", "video": "skipped", "audio": "none"})
+        self.assertEqual(state["records"]["keep"]["audio"], AUDIO_UNKNOWN)
+        self.assertEqual(state["records"]["keep"]["fails"], 0)
 
 class _RangeAwareHandler(BaseHTTPRequestHandler):
     """本地测试服务器：honor_range=True 时按 Range 返回 206 部分内容。"""

@@ -198,6 +198,7 @@ class TencentMeetingClient:
                             "recording_id": rec_id,
                             "detail_id": uuid_id,
                             "share_id": share_id,
+                            "uni_record_id": uni_id,
                             "topic": title,
                             "record_type": rec_type,
                             "has_video": has_video,
@@ -296,4 +297,41 @@ class TencentMeetingClient:
             "meeting_id": str(meeting_info.get("meeting_id") or ""),
             "sub_items": sub_items
         }
+
+    def get_download_links(self, uni_record_id: str) -> Dict[str, Dict[str, str]]:
+        """
+        解析录制记录的媒体下载直链（网页端"另存为"菜单的同源接口）。
+        API: /wemeet-cloudrecording-webapi/v1/download/meeting
+
+        id 为顶层记录的 uni_record_id；返回的每条 link 同时携带视频直链
+        (link, .mp4) 与纯音频直链 (audio_link, .m4a)，均为带 token 的
+        COS 地址，可直接流式下载并支持 Range 断点续传。
+
+        返回按资源 ID（COS 路径第三段，与子记录/单记录的 recording_id
+        同口径，即 uni_record_id + 1 及各分组讨论资源 ID）索引的字典：
+        {resource_id: {"video_url": ..., "audio_url": ...}}
+        """
+        endpoint = "/wemeet-cloudrecording-webapi/v1/download/meeting"
+        params = {
+            "id": uni_record_id,
+            "pwd": "",
+            "source": "owner",
+            "activity_uid": "",
+            "tk": "",
+            "need_multi_stream": "0",
+            "from_share": "1",
+            "enter_from": "share"
+        }
+        res = self._get(endpoint, params)
+        media: Dict[str, Dict[str, str]] = {}
+        for link in res.get("links") or []:
+            url = link.get("link") or link.get("audio_link") or ""
+            m = re.search(r"/cos/\d+/(\d+)/(\d+)/", url)
+            if not m:
+                continue
+            media[m.group(2)] = {
+                "video_url": link.get("link") or "",
+                "audio_url": link.get("audio_link") or ""
+            }
+        return media
 

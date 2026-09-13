@@ -1,6 +1,6 @@
 # 腾讯会议自动备份工具 (backup-tencent-meetings)
 
-一键遍历并批量下载**腾讯会议网页版**账号下所有历史会议的云录制视频（`.mp4`）与转写逐字稿（`.md` / `.txt` / `.srt` / `.json`）。默认增量运行：日常备份只处理新增或未完成的记录，通常一分钟内完成；配合断点续传与失败熔断，长时间无人值守跑全量也稳。
+一键遍历并批量下载**腾讯会议网页版**账号下所有历史会议的云录制视频（`.mp4`）、纯音频（`.m4a`）与转写逐字稿（`.md` / `.txt` / `.srt` / `.json`）。默认增量运行：日常备份只处理新增或未完成的记录，通常一分钟内完成；配合断点续传与失败熔断，长时间无人值守跑全量也稳。
 
 ---
 
@@ -9,7 +9,8 @@
 - 🤖 **账号全量自动遍历**：无需手动收集会议链接，自动通过 API 分页拉取您账号下记录的所有历史会议列表。
 - 🔗 **多类型场景兼容**：完美支持单会议录制、合集记录、以及包含多段视频的"中间记录页面"（`shared-record-middle`）自动递归展开。
 - 📝 **多格式逐字稿导出**：转写纪要自动导出为 **Markdown (`.md`)**、**纯文本 (`.txt`)**、**SRT 字幕 (`.srt`)** 及**原始 JSON (`.json`)** 格式。
-- 🎬 **音视频及封面自动拉取**：通过无头浏览器拦截带 token 的高清云录像直链，流式下载 `.mp4` 视频与会议封面缩略图。
+- 🎬 **音视频及封面自动拉取**：优先通过网页端"另存为"同源接口（`download/meeting`）直接解析带 token 的视频直链，流式下载（支持断点续传）；解析失败时回退无头浏览器拦截直链。
+- 🎧 **纯音频文件备份**：与网页端"另存为 → 纯音频文件"同源，按 `audio_{标识符}.m4a` 保存，支持断点续传；`download_audio` 开关控制，中途开启也能自动补齐历史记录。
 - 🔄 **默认增量备份**：本地状态清单（`downloads/.backup_state.json`）记录每条记录的处理状态，已完成记录不再调用任何接口、不再启动浏览器；列表始终完整遍历（30 条/页）以保证历史未完成记录（如中断的视频下载）总能被补齐。
 - ⚡ **智能重用与断点跳过**：已完成备份的音视频与转写文件自动识别校验，防止重复下载浪费带宽；首次运行自动扫描本地已有备份生成初始清单，无需任何迁移操作。
 - 📶 **大文件断点续传**：视频下载中断时自动保留已下载部分并携带 Range 头续传重试（最多 5 次），重试耗尽仍失败时保留进度，下次运行自动接着下，大文件不再前功尽弃。
@@ -24,14 +25,18 @@
 ### 备份流水线（单条录制记录）
 
 ```text
-列表 API 拿到记录 (meeting_id / recording_id / detail_id / has_video)
+列表 API 拿到记录 (meeting_id / recording_id / detail_id / has_video / uni_record_id)
+        │
+        ├─ 解析媒体直链 (download/meeting)：视频 link + 纯音频 audio_link，
+        │   按资源 ID 分发到单条记录或合集的各子记录
         │
         ├─ 合集记录？ ──是──> 调合集展开接口拆成子记录，逐条进入本流程
         │
         ├─ ① 录像封面：cover.png 直接下载
-        ├─ ② 云录制视频：无头浏览器打开分享页 → 拦截 /sign 接口返回的
-        │     带 token 直链 → 流式下载（断点续传）
-        └─ ③ 转写逐字稿：调 minutes 接口 → 格式化导出 md/txt/srt/json
+        ├─ ② 云录制视频：媒体直链流式下载（断点续传）；
+        │     直链不可用时回退无头浏览器打开分享页拦截 /sign 直链
+        ├─ ③ 纯音频文件：audio_link 直链下载 audio_{标识符}.m4a（断点续传）
+        └─ ④ 转写逐字稿：调 minutes 接口 → 格式化导出 md/txt/srt/json
         │
         └─ 按处理结果更新增量状态清单（原子写回 .backup_state.json）
 ```
@@ -83,6 +88,7 @@ backup-tencent-meetings/
 | 接口 | 用途 |
 | :--- | :--- |
 | `POST /wemeet-tapi/v2/meetlog/dashboard/my-record-list` | 录制列表，分页遍历（page_size=30，网页端单页上限） |
+| `GET /wemeet-cloudrecording-webapi/v1/download/meeting` | 媒体下载直链（视频 `link` + 纯音频 `audio_link`），网页端"另存为"菜单同源 |
 | `GET /wemeet-cloudrecording-webapi/v1/minutes/detail` | 转写逐字稿 |
 | `POST /wemeet-tapi/v2/meetlog/record-detail/page-query-record-files` | 合集（shared-record-middle）展开为子记录 |
 | `GET /wemeet-cloudrecording-webapi/v1/sign` | 分享页内签发的带 token 视频直链（浏览器拦截获取） |
@@ -139,7 +145,7 @@ python3 main.py
 | `cookie` | string | 必填 | 腾讯会议网页端完整 Cookie 字符串 |
 | `output_dir` | string | `./downloads` | 备份输出根目录 |
 | `download_video` | bool | `true` | 是否下载云录制视频 |
-| `download_audio` | bool | `false` | 音频下载（预留字段，当前版本未启用独立音频流） |
+| `download_audio` | bool | `false` | 是否下载纯音频文件（`audio_{标识符}.m4a`，网页端"另存为-纯音频文件"同源）；中途开启会自动补齐历史记录 |
 | `export_transcript` | bool | `true` | 是否导出转写逐字稿 |
 | `transcript_formats` | list | `["md","txt","json","srt"]` | 转写导出格式 |
 | `user_agent` | string | Chrome UA | 自定义请求 User-Agent（一般无需修改） |
@@ -204,6 +210,7 @@ downloads/
 ├── 选修课总结复盘_b4d20ddb-9464-41e2-a613-e3259c67baa6/
 │   ├── cover_b4d20ddb-9464-41e2-a613-e3259c67baa6.png          # 录像封面
 │   ├── video_b4d20ddb-9464-41e2-a613-e3259c67baa6.mp4          # 云录制视频
+│   ├── audio_b4d20ddb-9464-41e2-a613-e3259c67baa6.m4a          # 纯音频文件（可选）
 │   ├── transcript_b4d20ddb-9464-41e2-a613-e3259c67baa6.md      # Markdown 转写
 │   ├── transcript_b4d20ddb-9464-41e2-a613-e3259c67baa6.txt     # 纯文本转写
 │   ├── transcript_b4d20ddb-9464-41e2-a613-e3259c67baa6.srt     # SRT 播放字幕
@@ -222,6 +229,7 @@ downloads/
       "topic": "选修课总结复盘",                   // 会议主题
       "transcript_done": true,                    // 转写是否已导出
       "video": "done",                            // done | skipped | unknown | failed
+      "audio": "done",                            // done | skipped | unknown | failed | off
       "fails": 0,                                 // 连续失败次数（达 3 次增量不再自动重试）
       "container": false,                         // 是否为已完成的合集容器记录
       "updated_at": "2026-09-13 16:09:00"
@@ -230,7 +238,7 @@ downloads/
 }
 ```
 
-`video` 取值：`done`=视频已下载；`skipped`=该记录类型本身无视频（纯转写）；`unknown`=磁盘引导时无法判断、待与 API 对账；`failed`=下载失败。
+`video` 取值：`done`=视频已下载；`skipped`=该记录类型本身无视频（纯转写）；`unknown`=磁盘引导时无法判断、待与 API 对账；`failed`=下载失败。`audio` 取值同 `video`，另多一个 `off`=配置未启用音频下载（启用后会自动重置为待对账，补齐历史记录）。
 
 ---
 
@@ -273,6 +281,11 @@ python3 test_backup.py
 > **Q: 视频下载报 `HTTP Error 403: Forbidden`，但浏览器里能正常播放？**
 > * **原因**：腾讯服务端可能对旧会话的媒体访问整体拒绝（连之前能下载的记录也一起 403），而列表与转写接口不受影响。此时往往是本地 Cookie 对应的会话已失效。
 > * **解决**：在浏览器重新打开录制分享页确认视频可播放，然后复制**最新** Cookie 更新到 `config.json` 再运行；若浏览器里同样无法播放，则是腾讯侧问题，等待恢复后用 `--full` 补齐即可（失败记录已被状态清单记录，不会遗漏）。
+
+> [!NOTE]
+> **Q: 网页端"另存为"菜单有 4 种下载（视频内容/纯音频文件/逐字稿文本/时间轴文本），本工具都有备份吗？**
+> * **视频内容** → `video_{标识符}.mp4`；**纯音频文件** → `audio_{标识符}.m4a`（需开启 `download_audio`）。
+> * **逐字稿文本 / 时间轴文本** → 由转写导出覆盖：`transcript_{标识符}.md` / `.txt`（逐字稿阅读版）与 `.srt`（带时间轴的字幕版）、`.json`（原始数据）。
 
 > [!NOTE]
 > **Q: 视频下载到一半失败（超时/连接中断），之前的进度白下了吗？**

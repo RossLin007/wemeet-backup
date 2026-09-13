@@ -4,6 +4,7 @@
 标识符取值口径与备份目录命名保持一致：detail_id or recording_id or share_id or meeting_id。
 首次运行时若无状态文件，会扫描输出目录下已有备份产物自动生成初始清单（引导）。
 """
+import glob
 import json
 import os
 import time
@@ -19,6 +20,15 @@ VIDEO_DONE = "done"
 VIDEO_SKIPPED = "skipped"
 VIDEO_UNKNOWN = "unknown"
 VIDEO_FAILED = "failed"
+
+# audio 字段取值与 video 一致，另多一个 off：
+#   off=配置未启用音频下载（不参与完成判定）；之后启用 download_audio 时，
+#   已有的 off 会被重置为 unknown 重新对账，保证历史记录能补上音频。
+AUDIO_DONE = VIDEO_DONE
+AUDIO_SKIPPED = VIDEO_SKIPPED
+AUDIO_UNKNOWN = VIDEO_UNKNOWN
+AUDIO_FAILED = VIDEO_FAILED
+AUDIO_OFF = "off"
 
 
 def record_identifier(detail_id: str = "", recording_id: str = "",
@@ -36,6 +46,7 @@ def new_entry(topic: str = "") -> Dict[str, Any]:
         "topic": topic,
         "transcript_done": False,
         "video": VIDEO_UNKNOWN,
+        "audio": AUDIO_UNKNOWN,
         "fails": 0,
         "container": False,
         "updated_at": "",
@@ -47,10 +58,18 @@ def touch(entry: Dict[str, Any]) -> None:
 
 
 def is_complete(entry: Optional[Dict[str, Any]]) -> bool:
-    """转写已完成且视频已就绪（或该记录本身无视频）即视为备份完成。"""
+    """转写已完成、视频已就绪（或该记录本身无视频）、且音频已对账即视为备份完成。
+
+    audio 缺失（旧版状态文件）按 unknown 处理，会触发一次重新对账；
+    off 表示配置未启用音频下载，不阻塞完成判定。
+    """
     if not entry:
         return False
-    return bool(entry.get("transcript_done")) and entry.get("video") in (VIDEO_DONE, VIDEO_SKIPPED)
+    return (
+        bool(entry.get("transcript_done"))
+        and entry.get("video") in (VIDEO_DONE, VIDEO_SKIPPED)
+        and entry.get("audio", AUDIO_UNKNOWN) in (AUDIO_DONE, AUDIO_SKIPPED, AUDIO_OFF)
+    )
 
 
 def bootstrap_state(output_dir: str, formats: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -77,6 +96,13 @@ def bootstrap_state(output_dir: str, formats: Optional[List[str]] = None) -> Dic
             video_path = os.path.join(folder, f"video_{identifier}.mp4")
             if os.path.exists(video_path) and os.path.getsize(video_path) > 0:
                 entry["video"] = VIDEO_DONE
+            # 音频以 .m4a 为主、兼容 .mp3；磁盘扫描同样无法区分"无音频"与"未下载"，置 unknown 待对账
+            audio_done = any(
+                os.path.isfile(p) and not p.endswith(".tmp") and os.path.getsize(p) > 0
+                for p in glob.glob(os.path.join(folder, f"audio_{identifier}.*"))
+            )
+            if audio_done:
+                entry["audio"] = AUDIO_DONE
             records[identifier] = entry
         print(f"[增量初始化] 扫描完成，共登记 {len(records)} 条本地已有记录。")
     return {"version": 1, "records": records}

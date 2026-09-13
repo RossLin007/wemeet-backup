@@ -20,7 +20,7 @@ python3 -m pytest test_backup.py -q   # 17 个用例须全部通过
 | 文件 | 职责 |
 | :--- | :--- |
 | `main.py` | 入口：参数解析、输入调度（单条/批量文件/全自动）、增量主循环、状态更新 |
-| `tencent_meeting/client.py` | API 客户端：录制列表分页（30 条/页）、逐字稿、合集（shared-record-middle）展开 |
+| `tencent_meeting/client.py` | API 客户端：录制列表分页（30 条/页）、媒体直链（视频/音频，download/meeting）、逐字稿、合集（shared-record-middle）展开 |
 | `tencent_meeting/state.py` | 增量状态清单：磁盘引导、原子写回、完成判定、失败熔断 |
 | `tencent_meeting/downloader.py` | 流式下载器：断点续传（Range）、进度显示 |
 | `tencent_meeting/auto_crawler.py` | Playwright 无头浏览器：打开分享页拦截带 token 的 mp4 直链 |
