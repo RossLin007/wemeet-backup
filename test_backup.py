@@ -642,6 +642,95 @@ class TestCleaner(unittest.TestCase):
             self.assertNotIn("deleted_online", state["records"][f"id{i}"])
 
 
+class TestDownloaderForbiddenResume(unittest.TestCase):
+    """续传被 403 拒（直链 token 失效/风控）：丢弃 .tmp 改整段重试；仍被拒则放弃且不留 .tmp。"""
+
+    @staticmethod
+    def _serve(handler_cls):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server, f"http://127.0.0.1:{server.server_address[1]}/file.bin"
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.dest = os.path.join(self._tmpdir.name, "media.mp4")
+        self.addCleanup(self._tmpdir.cleanup)
+
+    def test_restart_fresh_when_resume_forbidden(self):
+        class _ForbiddenRangeHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.headers.get("Range"):
+                    self.send_response(403)
+                    self.end_headers()
+                    return
+                payload = _RangeAwareHandler.payload
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server, url = self._serve(_ForbiddenRangeHandler)
+        try:
+            with open(self.dest + ".tmp", "wb") as f:
+                f.write(b"PARTIAL")
+            self.assertTrue(download_file(url, self.dest))
+            with open(self.dest, "rb") as f:
+                self.assertEqual(f.read(), _RangeAwareHandler.payload)
+            self.assertFalse(os.path.exists(self.dest + ".tmp"))
+        finally:
+            server.shutdown()
+
+    def test_give_up_and_cleanup_when_always_forbidden(self):
+        class _AlwaysForbiddenHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(403)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server, url = self._serve(_AlwaysForbiddenHandler)
+        try:
+            with open(self.dest + ".tmp", "wb") as f:
+                f.write(b"PARTIAL")
+            self.assertFalse(download_file(url, self.dest))
+            self.assertFalse(os.path.exists(self.dest + ".tmp"))
+        finally:
+            server.shutdown()
+
+
+class TestRenameMigration(unittest.TestCase):
+    """云端会议改名后：旧主题目录唯一存在时自动迁移目录名，避免同标识符双目录。"""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.out = self._tmpdir.name
+        self.addCleanup(self._tmpdir.cleanup)
+
+    def test_migrates_unique_legacy_dir(self):
+        import main as main_mod
+        os.makedirs(os.path.join(self.out, "旧主题_id1"), exist_ok=True)
+        main_mod.migrate_legacy_dir(self.out, "新主题_id1", "id1")
+        self.assertTrue(os.path.isdir(os.path.join(self.out, "新主题_id1")))
+        self.assertFalse(os.path.exists(os.path.join(self.out, "旧主题_id1")))
+
+    def test_noop_when_target_exists_or_ambiguous(self):
+        import main as main_mod
+        # 目标已存在：不动旧目录
+        os.makedirs(os.path.join(self.out, "旧主题_id1"), exist_ok=True)
+        os.makedirs(os.path.join(self.out, "新主题_id1"), exist_ok=True)
+        main_mod.migrate_legacy_dir(self.out, "新主题_id1", "id1")
+        self.assertTrue(os.path.isdir(os.path.join(self.out, "旧主题_id1")))
+        # 旧目录有多个（歧义）：不迁移
+        os.makedirs(os.path.join(self.out, "主题A_id2"), exist_ok=True)
+        os.makedirs(os.path.join(self.out, "主题B_id2"), exist_ok=True)
+        main_mod.migrate_legacy_dir(self.out, "新主题_id2", "id2")
+        self.assertFalse(os.path.exists(os.path.join(self.out, "新主题_id2")))
+
+
 if __name__ == "__main__":
     unittest.main()
 

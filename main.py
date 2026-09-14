@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import sys
+import glob
 import json
 import argparse
 import urllib.parse
@@ -53,6 +54,34 @@ def load_config(config_path: str) -> Dict[str, Any]:
         return {}
 
 
+def _find_dirs_by_identifier(output_dir: str, identifier: str) -> List[str]:
+    """按 `主题_标识符` 命名约定列出该标识符的全部本地备份目录（精确后缀匹配）。"""
+    if not identifier:
+        return []
+    hits = []
+    for path in glob.glob(os.path.join(output_dir, f"*_{identifier}")):
+        if os.path.isdir(path) and os.path.basename(path).rsplit("_", 1)[-1] == identifier:
+            hits.append(path)
+    return hits
+
+
+def migrate_legacy_dir(output_dir: str, folder_name: str, identifier: str) -> None:
+    """云端会议改名后主题变化：若新主题目录不存在而旧主题目录（同标识符）唯一存在，
+    自动迁移目录名跟随改名；否则不动作（保持由本次备份正常创建/写入）。
+
+    防止按新主题另建目录造成同标识符双目录——那会令清理模式的本地目录唯一定位失效。
+    """
+    target = os.path.join(output_dir, folder_name)
+    if os.path.exists(target):
+        return
+    legacy = [d for d in _find_dirs_by_identifier(output_dir, identifier)
+              if os.path.basename(d) != folder_name]
+    if len(legacy) == 1:
+        print(f"[改名迁移] 检测到该记录的旧主题目录，跟随云端改名迁移: "
+              f"{os.path.basename(legacy[0])} -> {folder_name}")
+        os.rename(legacy[0], target)
+
+
 def process_single_backup(
     client: TencentMeetingClient,
     meeting_id: str,
@@ -87,6 +116,7 @@ def process_single_backup(
     )
     folder_name = f"{safe_topic}_{identifier}"
     target_dir = os.path.join(output_dir, folder_name)
+    migrate_legacy_dir(output_dir, folder_name, identifier)
     os.makedirs(target_dir, exist_ok=True)
 
     print(f"\n==================================================")
