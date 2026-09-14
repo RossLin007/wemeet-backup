@@ -3,6 +3,7 @@ import os
 import sys
 import glob
 import json
+import traceback
 import argparse
 import urllib.parse
 from datetime import datetime
@@ -32,6 +33,7 @@ from tencent_meeting.state import (
     touch
 )
 from tencent_meeting.cleaner import run_cleaner
+from tencent_meeting.runlog import RunLog, mode_label
 
 
 def sanitize_filename(name: str) -> str:
@@ -433,6 +435,29 @@ def main():
     if args.clean and (args.file or args.meeting_id or args.recording_id or args.share_id):
         parser.error("--clean 清理模式基于账号全量列表核对，不支持 -f/--meeting-id/--recording-id/--share-id")
 
+    # 运行日志：终端照常实时输出，同时完整留档到 logs/run-<时间戳>-<模式>.log，
+    # 结束后向 logs/run_index.jsonl 追加一行结果摘要（成功/失败数、失败明细、清理统计）。
+    run = RunLog(mode_label(args), meta={
+        "cli_no_video": args.no_video,
+        "cli_no_audio": args.no_audio,
+        "cli_no_transcript": args.no_transcript,
+        "output_dir": args.output or "./downloads",
+    })
+    try:
+        _run(args, run)
+    except SystemExit as e:
+        run.finish(status="ok" if e.code in (None, 0) else f"exit({e.code})")
+        raise
+    except KeyboardInterrupt:
+        run.finish(status="interrupted", error="用户中断 (Ctrl-C)")
+        raise
+    except Exception:
+        run.finish(status="crash", error=traceback.format_exc(limit=8))
+        raise
+    run.finish()
+
+
+def _run(args, run: RunLog):
     # Load configuration
     cfg = load_config(args.config)
     cookie_str = args.cookie or cfg.get("cookie", "")
@@ -469,7 +494,8 @@ def main():
 
     # 清理模式：只核对与删除，不下载（无需解析媒体直链），在备份调度前短路
     if args.clean:
-        sys.exit(run_cleaner(
+        clean_stats: Dict[str, Any] = {}
+        rc = run_cleaner(
             client=client,
             state=state,
             output_dir=output_dir,
@@ -479,7 +505,10 @@ def main():
             apply=args.apply,
             assume_yes=args.yes,
             limit=args.limit,
-        ))
+            stats=clean_stats,
+        )
+        run.extra.update(clean_stats)
+        sys.exit(rc)
 
     raw_items = []
 
@@ -538,15 +567,19 @@ def main():
             meeting_id=item.get("meeting_id", "")
         )
         entry = state["records"].get(identifier)
+        run.bump("processed")
 
         if incremental and is_complete(entry):
             print(f"\n进度 [{idx}/{len(items_to_process)}] [增量跳过] 已备份过: {item['topic']}")
             success_count += 1
+            run.bump("success")
             continue
 
         if incremental and entry and entry.get("fails", 0) >= MAX_FAILURES:
             print(f"\n进度 [{idx}/{len(items_to_process)}] [增量跳过] 该记录已连续失败 {entry['fails']} 次，本轮不再重试"
                   f"（如需重试请使用 --full）: {item['topic']}")
+            run.record_failure(identifier, item["topic"],
+                               f"连续失败 {entry['fails']} 次熔断跳过（--full 可重试）")
             continue
 
         print(f"\n进度 [{idx}/{len(items_to_process)}]")
@@ -572,8 +605,20 @@ def main():
         )
         update_record_state(state, identifier, item, result)
         save_state(output_dir, state)
+        if result.get("video") == "done":
+            run.bump("videos")
+        if result.get("audio") == "done":
+            run.bump("audios")
+        if result.get("transcript") == "done":
+            run.bump("transcripts")
         if result["ok"]:
             success_count += 1
+            run.bump("success")
+        else:
+            run.bump("failed")
+            run.record_failure(identifier, item["topic"],
+                               f"transcript={result.get('transcript')}, "
+                               f"video={result.get('video')}, audio={result.get('audio')}")
 
     print(f"\n==================================================")
     print(f"🎉 账号全量自动备份完成！成功备份: {success_count}/{len(items_to_process)} 场会议/子记录")

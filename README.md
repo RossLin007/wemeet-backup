@@ -78,6 +78,7 @@ backup-tencent-meetings/
     ├── client.py               # API 客户端：录制列表分页（30 条/页）、逐字稿、合集展开、线上删除
     ├── state.py                # 增量状态清单：加载/磁盘引导/原子写回/完成判定/失败计数
     ├── cleaner.py              # 线上清理：可删判定（本地实物校验）、干跑报告、--apply 删除/熔断/审计日志
+    ├── runlog.py               # 运行日志：终端双写留档 logs/run-*.log、结果摘要索引 logs/run_index.jsonl
     ├── auto_crawler.py         # Playwright 无头浏览器：打开分享页拦截带 token 的 mp4 直链
     ├── downloader.py           # 流式分块下载器：断点续传（Range）、进度显示、临时文件改名
     ├── formatter.py            # 转写数据格式化：Markdown / TXT / SRT / JSON
@@ -213,6 +214,23 @@ python3 main.py --clean --apply             # ③ 批量删除（交互确认需
 ```
 
 > **删除不可恢复**（连带线上转写与分享链接），因此工具设有硬性关卡：只有「线上有视频 + 增量状态已完成 + 本地视频/转写/音频文件逐一在盘校验 + 线上 allow_delete」全部满足才进入待删清单；合集须全部子记录校验齐备。本地备份文件永不删除。每次删除写入审计日志 `downloads/.deletion_log.jsonl` 并在状态清单标记 `deleted_online`。建议先跑一次常规增量备份（`python3 main.py`）再清理。
+
+---
+
+## 📜 运行日志（执行历史）
+
+每次运行 `main.py` 自动留档（终端输出不受影响）：
+
+```bash
+ls logs/                      # 全部运行历史：run-<时间戳>-<模式>.log，每次运行一个文件
+tail -n 2 logs/run_index.jsonl   # 最近两次运行的机器可读结果摘要
+python3 -m json.tool <<< "$(tail -n 1 logs/run_index.jsonl)"   # 格式化查看最近一次摘要
+```
+
+- **`logs/run-<时间戳>-<模式>.log`**：当次运行的完整输出（含下载进度外的全部日志），文件名即执行历史；模式含 `incremental`/`full`/`single`/`batch`/`clean`/`clean-apply`。
+- **`logs/run_index.jsonl`**：每次运行追加一行摘要——开始/结束时间、耗时、模式、状态（ok/interrupted/crash）、处理/成功/失败数、视频/音频/转写计数、失败明细（记录、原因，如「video=failed」「连续失败 3 次熔断跳过」）、清理模式统计（可删/已删/释放空间）。
+- 下载器的 `\r` 单行刷新进度不会写入日志（避免膨胀），只保留最终结果行。
+- 日志含会议标题等个人信息，`logs/` 已在 `.gitignore`，不会入库。
 
 ---
 

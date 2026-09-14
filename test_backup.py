@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
+import io
 import os
 import re
+import sys
 import json
 import tempfile
 import threading
@@ -729,6 +731,109 @@ class TestRenameMigration(unittest.TestCase):
         os.makedirs(os.path.join(self.out, "主题B_id2"), exist_ok=True)
         main_mod.migrate_legacy_dir(self.out, "新主题_id2", "id2")
         self.assertFalse(os.path.exists(os.path.join(self.out, "新主题_id2")))
+
+
+class TestRunLog(unittest.TestCase):
+    """运行日志：终端双写留档、\r 进度抑制、结果摘要索引、崩溃收尾。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.log_dir = os.path.join(self._tmp.name, "logs")
+        self.addCleanup(self._tmp.cleanup)
+
+    def _finish_safe(self, run):
+        try:
+            run.finish()
+        except Exception:
+            pass
+
+    def test_tee_suppresses_progress_and_keeps_lines(self):
+        from tencent_meeting.runlog import Tee
+        terminal = io.StringIO()
+        path = os.path.join(self._tmp.name, "tee.log")
+        with open(path, "w", encoding="utf-8") as f:
+            tee = Tee(terminal, f)
+            tee.write("\r  已下载: 1.00 MB / 3.00 MB (33%)")
+            tee.write("\r  已下载: 2.00 MB / 3.00 MB (66%)")
+            tee.write("\n")
+            tee.write("[下载完成] -> video.mp4\n")
+            tee.write("普通日志行\n")
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        self.assertNotIn("已下载", content)          # 进度刷新不落盘
+        self.assertIn("[下载完成] -> video.mp4\n", content)
+        self.assertIn("普通日志行\n", content)
+        # 终端侧原样透传（含 \r 进度）
+        self.assertIn("\r  已下载: 1.00 MB / 3.00 MB (33%)", terminal.getvalue())
+        self.assertIn("[下载完成] -> video.mp4\n", terminal.getvalue())
+
+    def test_run_log_files_and_summary(self):
+        from tencent_meeting.runlog import RunLog, RUN_INDEX_FILENAME
+        run = RunLog("incremental", log_dir=self.log_dir, meta={"output_dir": "downloads"})
+        self.addCleanup(lambda: self._finish_safe(run))
+        run.bump("processed", 10)
+        run.bump("success", 9)
+        run.bump("failed", 1)
+        run.bump("videos", 3)
+        run.record_failure("id-1", "某会议", "video=failed, audio=failed")
+        print("业务输出行")  # 应被留档
+        run.finish()
+
+        self.assertTrue(os.path.isdir(self.log_dir))
+        logs = [n for n in os.listdir(self.log_dir) if n.endswith("-incremental.log")]
+        self.assertEqual(len(logs), 1)
+        with open(os.path.join(self.log_dir, logs[0]), "r", encoding="utf-8") as f:
+            body = f.read()
+        self.assertIn("业务输出行", body)
+        self.assertIn("[失败] 某会议 (id-1)", body)
+        self.assertIn("[运行摘要]", body)
+
+        with open(os.path.join(self.log_dir, RUN_INDEX_FILENAME), "r", encoding="utf-8") as f:
+            summary = json.loads(f.read().strip().splitlines()[-1])
+        self.assertEqual(summary["mode"], "incremental")
+        self.assertEqual(summary["status"], "ok")
+        self.assertEqual(summary["processed"], 10)
+        self.assertEqual(summary["videos"], 3)
+        self.assertEqual(summary["failures_total"], 1)
+        self.assertEqual(summary["failures"][0]["identifier"], "id-1")
+        self.assertGreaterEqual(summary["duration_s"], 0)
+
+    def test_run_log_restores_streams_and_records_crash(self):
+        from tencent_meeting.runlog import RunLog, RUN_INDEX_FILENAME
+        old_out, old_err = sys.stdout, sys.stderr
+        run = RunLog("clean", log_dir=self.log_dir)
+        self.addCleanup(lambda: self._finish_safe(run))
+        self.assertIsNot(sys.stdout, old_out)  # 运行期间 stdout 被 Tee 包裹
+        run.finish(status="crash", error="ValueError: boom")
+        self.assertIs(sys.stdout, old_out)     # 收尾后恢复
+        self.assertIs(sys.stderr, old_err)
+        with open(os.path.join(self.log_dir, RUN_INDEX_FILENAME), "r", encoding="utf-8") as f:
+            summary = json.loads(f.read().strip().splitlines()[-1])
+        self.assertEqual(summary["status"], "crash")
+        self.assertIn("ValueError: boom", summary["error"])
+
+    def test_cleaner_fills_stats(self):
+        from tencent_meeting.cleaner import run_cleaner
+        out = os.path.join(self._tmp.name, "downloads")
+        os.makedirs(os.path.join(out, "主题_id1"), exist_ok=True)
+        with open(os.path.join(out, "主题_id1", "video_id1.mp4"), "wb") as f:
+            f.write(b"x" * 16)
+        with open(os.path.join(out, "主题_id1", "transcript_id1.md"), "wb") as f:
+            f.write(b"t")
+        entry = new_entry("主题id1")
+        entry["transcript_done"] = True
+        entry["video"] = VIDEO_DONE
+        entry["audio"] = AUDIO_DONE
+        state = {"records": {"id1": entry}}
+        client = _FakeCleanClient([{"meeting_id": "m", "recording_id": "r", "detail_id": "id1",
+                                    "share_id": "", "uni_record_id": "9", "topic": "主题id1",
+                                    "record_type": "cloud_record", "has_video": True,
+                                    "is_shared_middle": False, "jump_path": "",
+                                    "allow_delete": True, "cloud_size": 100}])
+        stats = {}
+        rc = run_cleaner(client, state, out, ["md"], apply=False, stats=stats)
+        self.assertEqual(rc, 0)
+        self.assertEqual(stats, {"deletable": 1, "skipped": 0})
 
 
 if __name__ == "__main__":

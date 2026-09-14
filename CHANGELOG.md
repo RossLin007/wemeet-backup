@@ -2,6 +2,25 @@
 
 本文件记录项目的显著变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [2026-09-14] 新增运行日志：main.py 执行历史与运行结果可查
+
+### 新增
+
+- **每次运行自动留档**：新模块 `tencent_meeting/runlog.py`。终端输出照常实时显示，同时双写（tee）到 `logs/run-<时间戳>-<模式>.log`；文件名即执行历史，模式含 incremental/full/single/batch/clean/clean-apply。
+- **结果摘要索引 `logs/run_index.jsonl`**：每次运行追加一行机器可读摘要——起止时间、耗时、模式、状态（ok/interrupted/crash/exit(n)）、处理/成功/失败数、视频/音频/转写计数、失败明细（记录、原因，至多 50 条）、清理模式统计（deletable/skipped/deleted/freed_bytes）。`tail logs/run_index.jsonl` 一行看懂任意一次运行结果。
+- **失败采集**：增量主循环把 `result.ok=False` 的记录（含 transcript/video/audio 各状态）与被熔断跳过（fails≥3）的记录写入当次日志与摘要——正是此前排查「视频没下载下来」时缺失的信息。
+- **细节**：stdout/stderr 双捕获（崩溃 traceback 留档）；下载器的 `\r` 单行刷新进度不落盘（避免日志膨胀），只保留结果行；异常路径 try/finally 保证崩溃也落摘要；清理模式经 `run_cleaner(stats=...)` 回填统计。
+- 敏感红线：日志含会议标题/标识符，`logs/` 已加入 `.gitignore` 与 AGENTS.md 红线清单。
+
+### 为什么
+
+排查「协同之舞-思维方式的力量 视频没下载下来」时发现：所有输出仅打印到终端即逝，无法回查历史运行的失败记录与原因，只能靠状态清单反推。
+
+### 验证
+
+- 39 个单元测试通过（新增 TestRunLog 4 例：\r 进度抑制与终端透传、日志文件与摘要索引字段、崩溃收尾恢复流、清理 stats 回填）。
+- 实跑 `--clean` 干跑与常规增量：`logs/` 生成对应日志，`run_index.jsonl` 摘要含 deletable=58/skipped=1 等清理统计。
+
 ## [2026-09-14] 修复续传 403 死循环 + 云端改名自动迁移目录
 
 ### 修复

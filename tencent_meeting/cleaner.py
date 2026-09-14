@@ -239,12 +239,19 @@ def run_cleaner(client: Any, state: Dict[str, Any], output_dir: str,
                 formats: List[str], need_transcript: bool = True,
                 need_audio: bool = False, apply: bool = False,
                 assume_yes: bool = False, limit: Optional[int] = None,
-                prompt: Callable[[str], str] = input) -> int:
-    """清理入口：干跑出报告 / apply 真删。返回退出码（0 正常）。"""
+                prompt: Callable[[str], str] = input,
+                stats: Optional[Dict[str, Any]] = None) -> int:
+    """清理入口：干跑出报告 / apply 真删。返回退出码（0 正常）。
+
+    stats 传入字典时回填运行统计（deletable/skipped/deleted/delete_failed/
+    freed_bytes），供运行日志摘要使用；不影响行为。
+    """
     print("[清理模式] 正在遍历线上录制列表并核对本地备份…")
     deletable, skipped = select_deletable(client, state, output_dir, formats,
                                           need_transcript, need_audio)
     _print_report(deletable, skipped)
+    if stats is not None:
+        stats.update({"deletable": len(deletable), "skipped": len(skipped)})
 
     if not deletable:
         print("\n[清理模式] 没有可删除的记录。")
@@ -317,4 +324,7 @@ def run_cleaner(client: Any, state: Dict[str, Any], output_dir: str,
           f"预计释放线上空间 {human_size(freed_bytes)}。")
     print(f"删除日志: {os.path.join(output_dir, DELETION_LOG_FILENAME)}")
     print("=" * 60)
+    if stats is not None:
+        stats.update({"deleted": ok_count, "delete_failed": fail_count,
+                      "freed_bytes": freed_bytes})
     return 0

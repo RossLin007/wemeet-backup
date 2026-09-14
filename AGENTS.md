@@ -23,6 +23,7 @@ python3 -m pytest test_backup.py -q   # 全部用例须通过
 | `tencent_meeting/client.py` | API 客户端：录制列表分页（30 条/页）、媒体直链（视频/音频，download/meeting）、逐字稿、合集（shared-record-middle）展开、线上删除（delete-record-info） |
 | `tencent_meeting/state.py` | 增量状态清单：磁盘引导、原子写回、完成判定、失败熔断 |
 | `tencent_meeting/cleaner.py` | 线上清理：可删判定（本地实物校验）、干跑报告、--apply 删除循环、熔断、审计日志 |
+| `tencent_meeting/runlog.py` | 运行日志：Tee 双写（抑制 \r 进度）、每次运行留档 logs/run-*.log、结果摘要索引 logs/run_index.jsonl |
 | `tencent_meeting/downloader.py` | 流式下载器：断点续传（Range）、进度显示 |
 | `tencent_meeting/auto_crawler.py` | Playwright 无头浏览器：打开分享页拦截带 token 的 mp4 直链 |
 | `tencent_meeting/formatter.py` / `url_parser.py` | 转写格式化 / 会议链接解析 |
@@ -34,7 +35,7 @@ python3 -m pytest test_backup.py -q   # 全部用例须通过
 
 以下内容已在 `.gitignore`，不得以任何形式带入被跟踪文件：
 
-- `config.json`（含登录 Cookie）、`downloads/`（备份数据）、`有视频的会议记录.md`（个人核对报告）；
+- `config.json`（含登录 Cookie）、`downloads/`（备份数据）、`logs/`（运行日志，含会议标题）、`有视频的会议记录.md`（个人核对报告）；
 - Cookie 字符串、会议标题、回放链接等个人信息不得写入代码、文档或提交信息。
 
 ## 关键设计决策（勿回退）
