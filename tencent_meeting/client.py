@@ -203,7 +203,11 @@ class TencentMeetingClient:
                             "record_type": rec_type,
                             "has_video": has_video,
                             "is_shared_middle": is_middle,
-                            "jump_path": jump_path
+                            "jump_path": jump_path,
+                            # 清理模式用：线上是否允许删除（列表原始字段，缺失时默认允许）
+                            "allow_delete": bool(r.get("allow_delete", True)),
+                            # 该记录线上占用（字节，列表原始字段 size，用于估算可释放空间）
+                            "cloud_size": int(r.get("size") or 0)
                         })
 
                 all_meetings.extend(page_items)
@@ -334,4 +338,16 @@ class TencentMeetingClient:
                 "audio_url": link.get("audio_link") or ""
             }
         return media
+
+    def delete_record(self, uni_record_ids: List[str]) -> Dict[str, Any]:
+        """删除线上云录制记录（网页端「我的录制 → 管理 → 删除」的同源接口）。
+        API: /wemeet-tapi/v2/meetlog/dashboard/delete-record-info
+
+        uni_record_ids 为顶层记录的 uni_record_id 列表（网页端支持批量勾选）。
+        删除单位是整条录制记录：连同其全部录制文件、线上转写与对外分享链接
+        一并删除，且不可恢复。返回原始响应 JSON，调用方以 code == 0 判定成功。
+        """
+        endpoint = "/wemeet-tapi/v2/meetlog/dashboard/delete-record-info"
+        payload = {"uni_record_ids": [str(u) for u in uni_record_ids if str(u).strip()]}
+        return self._post(endpoint, payload)
 

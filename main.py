@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import os
 import sys
+import glob
 import json
+import traceback
 import argparse
 import urllib.parse
 from datetime import datetime
@@ -30,6 +32,8 @@ from tencent_meeting.state import (
     save_state,
     touch
 )
+from tencent_meeting.cleaner import run_cleaner
+from tencent_meeting.runlog import RunLog, mode_label
 
 
 def sanitize_filename(name: str) -> str:
@@ -50,6 +54,34 @@ def load_config(config_path: str) -> Dict[str, Any]:
     except Exception as e:
         print(f"[警告] 无法读取配置文件 {config_path}: {e}")
         return {}
+
+
+def _find_dirs_by_identifier(output_dir: str, identifier: str) -> List[str]:
+    """按 `主题_标识符` 命名约定列出该标识符的全部本地备份目录（精确后缀匹配）。"""
+    if not identifier:
+        return []
+    hits = []
+    for path in glob.glob(os.path.join(output_dir, f"*_{identifier}")):
+        if os.path.isdir(path) and os.path.basename(path).rsplit("_", 1)[-1] == identifier:
+            hits.append(path)
+    return hits
+
+
+def migrate_legacy_dir(output_dir: str, folder_name: str, identifier: str) -> None:
+    """云端会议改名后主题变化：若新主题目录不存在而旧主题目录（同标识符）唯一存在，
+    自动迁移目录名跟随改名；否则不动作（保持由本次备份正常创建/写入）。
+
+    防止按新主题另建目录造成同标识符双目录——那会令清理模式的本地目录唯一定位失效。
+    """
+    target = os.path.join(output_dir, folder_name)
+    if os.path.exists(target):
+        return
+    legacy = [d for d in _find_dirs_by_identifier(output_dir, identifier)
+              if os.path.basename(d) != folder_name]
+    if len(legacy) == 1:
+        print(f"[改名迁移] 检测到该记录的旧主题目录，跟随云端改名迁移: "
+              f"{os.path.basename(legacy[0])} -> {folder_name}")
+        os.rename(legacy[0], target)
 
 
 def process_single_backup(
@@ -86,6 +118,7 @@ def process_single_backup(
     )
     folder_name = f"{safe_topic}_{identifier}"
     target_dir = os.path.join(output_dir, folder_name)
+    migrate_legacy_dir(output_dir, folder_name, identifier)
     os.makedirs(target_dir, exist_ok=True)
 
     print(f"\n==================================================")
@@ -391,8 +424,40 @@ def main():
     parser.add_argument("--no-audio", action="store_true", help="跳过下载音频")
     parser.add_argument("--no-transcript", action="store_true", help="跳过导出转写记录")
     parser.add_argument("--full", action="store_true", help="忽略增量状态强制全量备份（重试失败记录、重新展开合集）")
+    parser.add_argument("--clean", action="store_true", help="清理模式：核对本地备份后，列出可安全删除的线上有视频记录（默认干跑不删除）")
+    parser.add_argument("--apply", action="store_true", help="配合 --clean 真正执行线上删除（不可恢复，本地备份保留）")
+    parser.add_argument("--yes", action="store_true", help="配合 --clean --apply 跳过交互确认（脚本化场景）")
+    parser.add_argument("--limit", type=int, help="配合 --clean --apply：本次最多删除 N 条（建议首删用 --limit 1 验证）")
     args = parser.parse_args()
 
+    if args.apply and not args.clean:
+        parser.error("--apply 仅在 --clean 清理模式下有效")
+    if args.clean and (args.file or args.meeting_id or args.recording_id or args.share_id):
+        parser.error("--clean 清理模式基于账号全量列表核对，不支持 -f/--meeting-id/--recording-id/--share-id")
+
+    # 运行日志：终端照常实时输出，同时完整留档到 logs/run-<时间戳>-<模式>.log，
+    # 结束后向 logs/run_index.jsonl 追加一行结果摘要（成功/失败数、失败明细、清理统计）。
+    run = RunLog(mode_label(args), meta={
+        "cli_no_video": args.no_video,
+        "cli_no_audio": args.no_audio,
+        "cli_no_transcript": args.no_transcript,
+        "output_dir": args.output or "./downloads",
+    })
+    try:
+        _run(args, run)
+    except SystemExit as e:
+        run.finish(status="ok" if e.code in (None, 0) else f"exit({e.code})")
+        raise
+    except KeyboardInterrupt:
+        run.finish(status="interrupted", error="用户中断 (Ctrl-C)")
+        raise
+    except Exception:
+        run.finish(status="crash", error=traceback.format_exc(limit=8))
+        raise
+    run.finish()
+
+
+def _run(args, run: RunLog):
     # Load configuration
     cfg = load_config(args.config)
     cookie_str = args.cookie or cfg.get("cookie", "")
@@ -426,6 +491,24 @@ def main():
     save_state(output_dir, state)
 
     client = TencentMeetingClient(cookie_str=cookie_str, user_agent=user_agent)
+
+    # 清理模式：只核对与删除，不下载（无需解析媒体直链），在备份调度前短路
+    if args.clean:
+        clean_stats: Dict[str, Any] = {}
+        rc = run_cleaner(
+            client=client,
+            state=state,
+            output_dir=output_dir,
+            formats=formats,
+            need_transcript=export_transcript,
+            need_audio=download_audio,
+            apply=args.apply,
+            assume_yes=args.yes,
+            limit=args.limit,
+            stats=clean_stats,
+        )
+        run.extra.update(clean_stats)
+        sys.exit(rc)
 
     raw_items = []
 
@@ -484,15 +567,19 @@ def main():
             meeting_id=item.get("meeting_id", "")
         )
         entry = state["records"].get(identifier)
+        run.bump("processed")
 
         if incremental and is_complete(entry):
             print(f"\n进度 [{idx}/{len(items_to_process)}] [增量跳过] 已备份过: {item['topic']}")
             success_count += 1
+            run.bump("success")
             continue
 
         if incremental and entry and entry.get("fails", 0) >= MAX_FAILURES:
             print(f"\n进度 [{idx}/{len(items_to_process)}] [增量跳过] 该记录已连续失败 {entry['fails']} 次，本轮不再重试"
                   f"（如需重试请使用 --full）: {item['topic']}")
+            run.record_failure(identifier, item["topic"],
+                               f"连续失败 {entry['fails']} 次熔断跳过（--full 可重试）")
             continue
 
         print(f"\n进度 [{idx}/{len(items_to_process)}]")
@@ -518,8 +605,20 @@ def main():
         )
         update_record_state(state, identifier, item, result)
         save_state(output_dir, state)
+        if result.get("video") == "done":
+            run.bump("videos")
+        if result.get("audio") == "done":
+            run.bump("audios")
+        if result.get("transcript") == "done":
+            run.bump("transcripts")
         if result["ok"]:
             success_count += 1
+            run.bump("success")
+        else:
+            run.bump("failed")
+            run.record_failure(identifier, item["topic"],
+                               f"transcript={result.get('transcript')}, "
+                               f"video={result.get('video')}, audio={result.get('audio')}")
 
     print(f"\n==================================================")
     print(f"🎉 账号全量自动备份完成！成功备份: {success_count}/{len(items_to_process)} 场会议/子记录")

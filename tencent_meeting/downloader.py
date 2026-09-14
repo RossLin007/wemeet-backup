@@ -115,6 +115,16 @@ def download_file(url: str, dest_path: str, headers: Optional[Dict[str, str]] = 
 
         except Exception as e:
             sys.stdout.write("\n")
+            forbidden = getattr(e, "code", None) == 403 or " 403 " in f" {e} "
+            # 403 属于直链 token 失效/风控拒绝：携带 Range 的续传请求会被直接拒掉，
+            # 原地重试毫无意义。丢弃半截 .tmp 改为整段 GET 重试一次（链接尚有效即可救回），
+            # 仍被拒则放弃且不留无用的 .tmp。
+            if forbidden and resume_from > 0 and attempt < max_retries:
+                print(f"  [续传被拒] {e}；丢弃已下载部分，改为整段重试...")
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                time.sleep(2)
+                continue
             saved = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
             if attempt < max_retries and saved > 0:
                 print(f"[下载中断] {e}；已保留 {_format_size(saved)}，第 {attempt + 1}/{max_retries} 次断点续传重试...")

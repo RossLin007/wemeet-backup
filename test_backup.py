@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
+import io
 import os
 import re
+import sys
 import json
 import tempfile
 import threading
@@ -45,7 +47,7 @@ class TestExpandMiddleContainers(unittest.TestCase):
     """回归：父合集只有在全部子记录备份完成后才能标记为完成容器。
 
     此前父记录在展开成功时即被标完成，导致增量运行跳过整个合集，
-    未完成视频的子记录（如 协同之舞-品德成功论_录制1）永远不会再被处理。
+    未完成视频的子记录永远不会再被处理。
     """
 
     PARENT = {"meeting_id": "", "recording_id": "", "share_id": "parentS",
@@ -448,6 +450,390 @@ class TestDownloaderResume(unittest.TestCase):
                 self.assertEqual(f.read(), _NoRangeHandler.payload)
         finally:
             server.shutdown()
+
+
+class _FakeCleanClient:
+    """Stub of TencentMeetingClient for cleaner tests."""
+
+    def __init__(self, items, subs=None, fail_delete=False):
+        self._items = items
+        self._subs = subs or []
+        self.deleted = []  # 每次 delete_record 的 uni_record_ids 参数
+        self.fail_delete = fail_delete
+
+    def get_all_user_meetings(self):
+        return self._items
+
+    def get_shared_record_middle_list(self, share_id):
+        return {"topic": "合集主题", "meeting_id": "", "sub_items": self._subs}
+
+    def delete_record(self, uni_record_ids):
+        self.deleted.append(list(uni_record_ids))
+        if self.fail_delete:
+            raise RuntimeError("cookie expired")
+        return {"code": 0}
+
+
+class TestCleaner(unittest.TestCase):
+    """清理模式：只删「线上有视频 + 状态完成 + 本地实物齐备」的记录，默认干跑。"""
+
+    FORMATS = ["md"]
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.out = self._tmp.name
+        self.addCleanup(self._tmp.cleanup)
+
+    def _backup_dir(self, ident, topic="主题", with_video=True, with_transcript=True):
+        d = os.path.join(self.out, f"{topic}_{ident}")
+        os.makedirs(d, exist_ok=True)
+        if with_video:
+            with open(os.path.join(d, f"video_{ident}.mp4"), "wb") as f:
+                f.write(b"x" * 16)
+        if with_transcript:
+            for fmt in self.FORMATS:
+                with open(os.path.join(d, f"transcript_{ident}.{fmt}"), "wb") as f:
+                    f.write(b"t")
+        return d
+
+    @staticmethod
+    def _done_entry(topic="主题"):
+        entry = new_entry(topic)
+        entry["transcript_done"] = True
+        entry["video"] = VIDEO_DONE
+        entry["audio"] = AUDIO_DONE
+        return entry
+
+    def _item(self, ident, uni="9001", **over):
+        item = {"meeting_id": "m1", "recording_id": "9002", "detail_id": ident,
+                "share_id": "", "uni_record_id": uni, "topic": "主题" + ident,
+                "record_type": "cloud_record", "has_video": True,
+                "is_shared_middle": False, "jump_path": "",
+                "allow_delete": True, "cloud_size": 1000}
+        item.update(over)
+        return item
+
+    def _state(self, *idents):
+        return {"records": {i: self._done_entry() for i in idents}}
+
+    def test_selects_fully_backed_video_record(self):
+        from tencent_meeting.cleaner import select_deletable
+        self._backup_dir("id1")
+        self._backup_dir("id2")
+        client = _FakeCleanClient([self._item("id1", uni="9001"),
+                                   self._item("id2", uni="1000")])
+        deletable, skipped = select_deletable(client, self._state("id1", "id2"), self.out, self.FORMATS)
+        self.assertEqual(len(deletable), 2)
+        self.assertEqual(skipped, [])
+        # 旧记录（uni 小）排在前面，--limit 截断时优先删最旧的
+        self.assertEqual([d["uni_record_id"] for d in deletable], ["1000", "9001"])
+
+    def test_skips_when_local_video_missing(self):
+        from tencent_meeting.cleaner import select_deletable
+        self._backup_dir("id1", with_video=False)  # 状态完成但视频文件不在盘
+        client = _FakeCleanClient([self._item("id1")])
+        deletable, skipped = select_deletable(client, self._state("id1"), self.out, self.FORMATS)
+        self.assertEqual(deletable, [])
+        self.assertIn("本地视频文件缺失", skipped[0]["reason"])
+
+    def test_skips_when_state_incomplete_or_ambiguous_dir(self):
+        from tencent_meeting.cleaner import select_deletable
+        # 状态缺失
+        self._backup_dir("id1")
+        client = _FakeCleanClient([self._item("id1")])
+        deletable, skipped = select_deletable(client, self._state(), self.out, self.FORMATS)
+        self.assertEqual(deletable, [])
+        self.assertIn("备份状态未完成", skipped[0]["reason"])
+        # 同一标识符有两个候选目录 → 无法唯一定位，跳过
+        self._backup_dir("id2", topic="a")
+        self._backup_dir("id2", topic="b")
+        client = _FakeCleanClient([self._item("id2")])
+        deletable, skipped = select_deletable(client, self._state("id2"), self.out, self.FORMATS)
+        self.assertEqual(deletable, [])
+        self.assertIn("无法唯一定位", skipped[0]["reason"])
+
+    def test_ignores_no_video_and_allow_delete_false(self):
+        from tencent_meeting.cleaner import select_deletable
+        self._backup_dir("id1")
+        self._backup_dir("id2")
+        client = _FakeCleanClient([
+            self._item("id1", has_video=False),
+            self._item("id2", allow_delete=False),
+        ])
+        deletable, skipped = select_deletable(client, self._state("id1", "id2"), self.out, self.FORMATS)
+        self.assertEqual(deletable, [])  # 无视频记录连跳过清单都不进
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("allow_delete", skipped[0]["reason"])
+
+    def test_container_requires_all_subs_backed_up(self):
+        from tencent_meeting.cleaner import select_deletable
+        parent = self._item("", uni="9005", detail_id="", share_id="parentS",
+                            is_shared_middle=True, topic="合集",
+                            recording_id="", meeting_id="")
+        subs = [{"meeting_id": "", "recording_id": "r1", "detail_id": "d1",
+                 "share_id": "sh-d1", "topic": "子1"},
+                {"meeting_id": "", "recording_id": "r2", "detail_id": "d2",
+                 "share_id": "sh-d2", "topic": "子2"}]
+        self._backup_dir("d1")
+        self._backup_dir("d2", with_video=False)  # 子2 视频缺失
+        state = self._state("d1", "d2", "parentS")
+        client = _FakeCleanClient([parent], subs=subs)
+        deletable, skipped = select_deletable(client, state, self.out, self.FORMATS)
+        self.assertEqual(deletable, [])
+        self.assertIn("子记录备份不齐", skipped[0]["reason"])
+
+        # 补齐子2 视频后整个合集可删
+        with open(os.path.join(self.out, "主题_d2", "video_d2.mp4"), "wb") as f:
+            f.write(b"x" * 16)
+        deletable, skipped = select_deletable(client, state, self.out, self.FORMATS)
+        self.assertEqual(len(deletable), 1)
+        self.assertTrue(deletable[0]["is_container"])
+        self.assertEqual(deletable[0]["sub_identifiers"], ["d1", "d2"])
+
+    def test_dry_run_never_deletes(self):
+        from tencent_meeting.cleaner import run_cleaner, DELETION_LOG_FILENAME
+        self._backup_dir("id1")
+        client = _FakeCleanClient([self._item("id1")])
+        state = self._state("id1")
+        rc = run_cleaner(client, state, self.out, self.FORMATS, apply=False)
+        self.assertEqual(rc, 0)
+        self.assertEqual(client.deleted, [])  # 干跑绝不调用删除
+        self.assertFalse(os.path.exists(os.path.join(self.out, DELETION_LOG_FILENAME)))
+        self.assertNotIn("deleted_online", state["records"]["id1"])
+
+    def test_apply_deletes_marks_state_and_logs(self):
+        from tencent_meeting.cleaner import run_cleaner, DELETION_LOG_FILENAME
+        self._backup_dir("id1")
+        client = _FakeCleanClient([self._item("id1")])
+        state = self._state("id1")
+        rc = run_cleaner(client, state, self.out, self.FORMATS,
+                         apply=True, assume_yes=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(client.deleted, [["9001"]])
+        self.assertTrue(state["records"]["id1"]["deleted_online"])  # 审计标记
+        log_path = os.path.join(self.out, DELETION_LOG_FILENAME)
+        self.assertTrue(os.path.exists(log_path))
+        with open(log_path, "r", encoding="utf-8") as f:
+            entry = json.loads(f.read().strip())
+        self.assertEqual(entry["uni_record_id"], "9001")
+        self.assertTrue(entry["ok"])
+        # 本地备份原样保留
+        self.assertTrue(os.path.getsize(os.path.join(self.out, "主题_id1", "video_id1.mp4")) > 0)
+
+    def test_apply_confirm_mismatch_cancels(self):
+        from tencent_meeting.cleaner import run_cleaner
+        self._backup_dir("id1")
+        client = _FakeCleanClient([self._item("id1")])
+        rc = run_cleaner(client, self._state("id1"), self.out, self.FORMATS,
+                         apply=True, prompt=lambda _: "错的输入")
+        self.assertEqual(rc, 0)
+        self.assertEqual(client.deleted, [])
+
+    def test_apply_failure_circuit_breaker(self):
+        from tencent_meeting.cleaner import run_cleaner, DELETION_LOG_FILENAME
+        items = [self._item(f"id{i}", uni=str(9000 + i)) for i in range(1, 5)]
+        for i in range(1, 5):
+            self._backup_dir(f"id{i}")
+        state = self._state(*[f"id{i}" for i in range(1, 5)])
+        client = _FakeCleanClient(items, fail_delete=True)
+        rc = run_cleaner(client, state, self.out, self.FORMATS,
+                         apply=True, assume_yes=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(client.deleted), 3)  # 连续 3 次失败熔断，第 4 条不再尝试
+        for i in range(1, 5):
+            self.assertNotIn("deleted_online", state["records"][f"id{i}"])
+
+
+class TestDownloaderForbiddenResume(unittest.TestCase):
+    """续传被 403 拒（直链 token 失效/风控）：丢弃 .tmp 改整段重试；仍被拒则放弃且不留 .tmp。"""
+
+    @staticmethod
+    def _serve(handler_cls):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server, f"http://127.0.0.1:{server.server_address[1]}/file.bin"
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.dest = os.path.join(self._tmpdir.name, "media.mp4")
+        self.addCleanup(self._tmpdir.cleanup)
+
+    def test_restart_fresh_when_resume_forbidden(self):
+        class _ForbiddenRangeHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.headers.get("Range"):
+                    self.send_response(403)
+                    self.end_headers()
+                    return
+                payload = _RangeAwareHandler.payload
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server, url = self._serve(_ForbiddenRangeHandler)
+        try:
+            with open(self.dest + ".tmp", "wb") as f:
+                f.write(b"PARTIAL")
+            self.assertTrue(download_file(url, self.dest))
+            with open(self.dest, "rb") as f:
+                self.assertEqual(f.read(), _RangeAwareHandler.payload)
+            self.assertFalse(os.path.exists(self.dest + ".tmp"))
+        finally:
+            server.shutdown()
+
+    def test_give_up_and_cleanup_when_always_forbidden(self):
+        class _AlwaysForbiddenHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(403)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server, url = self._serve(_AlwaysForbiddenHandler)
+        try:
+            with open(self.dest + ".tmp", "wb") as f:
+                f.write(b"PARTIAL")
+            self.assertFalse(download_file(url, self.dest))
+            self.assertFalse(os.path.exists(self.dest + ".tmp"))
+        finally:
+            server.shutdown()
+
+
+class TestRenameMigration(unittest.TestCase):
+    """云端会议改名后：旧主题目录唯一存在时自动迁移目录名，避免同标识符双目录。"""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.out = self._tmpdir.name
+        self.addCleanup(self._tmpdir.cleanup)
+
+    def test_migrates_unique_legacy_dir(self):
+        import main as main_mod
+        os.makedirs(os.path.join(self.out, "旧主题_id1"), exist_ok=True)
+        main_mod.migrate_legacy_dir(self.out, "新主题_id1", "id1")
+        self.assertTrue(os.path.isdir(os.path.join(self.out, "新主题_id1")))
+        self.assertFalse(os.path.exists(os.path.join(self.out, "旧主题_id1")))
+
+    def test_noop_when_target_exists_or_ambiguous(self):
+        import main as main_mod
+        # 目标已存在：不动旧目录
+        os.makedirs(os.path.join(self.out, "旧主题_id1"), exist_ok=True)
+        os.makedirs(os.path.join(self.out, "新主题_id1"), exist_ok=True)
+        main_mod.migrate_legacy_dir(self.out, "新主题_id1", "id1")
+        self.assertTrue(os.path.isdir(os.path.join(self.out, "旧主题_id1")))
+        # 旧目录有多个（歧义）：不迁移
+        os.makedirs(os.path.join(self.out, "主题A_id2"), exist_ok=True)
+        os.makedirs(os.path.join(self.out, "主题B_id2"), exist_ok=True)
+        main_mod.migrate_legacy_dir(self.out, "新主题_id2", "id2")
+        self.assertFalse(os.path.exists(os.path.join(self.out, "新主题_id2")))
+
+
+class TestRunLog(unittest.TestCase):
+    """运行日志：终端双写留档、\r 进度抑制、结果摘要索引、崩溃收尾。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.log_dir = os.path.join(self._tmp.name, "logs")
+        self.addCleanup(self._tmp.cleanup)
+
+    def _finish_safe(self, run):
+        try:
+            run.finish()
+        except Exception:
+            pass
+
+    def test_tee_suppresses_progress_and_keeps_lines(self):
+        from tencent_meeting.runlog import Tee
+        terminal = io.StringIO()
+        path = os.path.join(self._tmp.name, "tee.log")
+        with open(path, "w", encoding="utf-8") as f:
+            tee = Tee(terminal, f)
+            tee.write("\r  已下载: 1.00 MB / 3.00 MB (33%)")
+            tee.write("\r  已下载: 2.00 MB / 3.00 MB (66%)")
+            tee.write("\n")
+            tee.write("[下载完成] -> video.mp4\n")
+            tee.write("普通日志行\n")
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        self.assertNotIn("已下载", content)          # 进度刷新不落盘
+        self.assertIn("[下载完成] -> video.mp4\n", content)
+        self.assertIn("普通日志行\n", content)
+        # 终端侧原样透传（含 \r 进度）
+        self.assertIn("\r  已下载: 1.00 MB / 3.00 MB (33%)", terminal.getvalue())
+        self.assertIn("[下载完成] -> video.mp4\n", terminal.getvalue())
+
+    def test_run_log_files_and_summary(self):
+        from tencent_meeting.runlog import RunLog, RUN_INDEX_FILENAME
+        run = RunLog("incremental", log_dir=self.log_dir, meta={"output_dir": "downloads"})
+        self.addCleanup(lambda: self._finish_safe(run))
+        run.bump("processed", 10)
+        run.bump("success", 9)
+        run.bump("failed", 1)
+        run.bump("videos", 3)
+        run.record_failure("id-1", "某会议", "video=failed, audio=failed")
+        print("业务输出行")  # 应被留档
+        run.finish()
+
+        self.assertTrue(os.path.isdir(self.log_dir))
+        logs = [n for n in os.listdir(self.log_dir) if n.endswith("-incremental.log")]
+        self.assertEqual(len(logs), 1)
+        with open(os.path.join(self.log_dir, logs[0]), "r", encoding="utf-8") as f:
+            body = f.read()
+        self.assertIn("业务输出行", body)
+        self.assertIn("[失败] 某会议 (id-1)", body)
+        self.assertIn("[运行摘要]", body)
+
+        with open(os.path.join(self.log_dir, RUN_INDEX_FILENAME), "r", encoding="utf-8") as f:
+            summary = json.loads(f.read().strip().splitlines()[-1])
+        self.assertEqual(summary["mode"], "incremental")
+        self.assertEqual(summary["status"], "ok")
+        self.assertEqual(summary["processed"], 10)
+        self.assertEqual(summary["videos"], 3)
+        self.assertEqual(summary["failures_total"], 1)
+        self.assertEqual(summary["failures"][0]["identifier"], "id-1")
+        self.assertGreaterEqual(summary["duration_s"], 0)
+
+    def test_run_log_restores_streams_and_records_crash(self):
+        from tencent_meeting.runlog import RunLog, RUN_INDEX_FILENAME
+        old_out, old_err = sys.stdout, sys.stderr
+        run = RunLog("clean", log_dir=self.log_dir)
+        self.addCleanup(lambda: self._finish_safe(run))
+        self.assertIsNot(sys.stdout, old_out)  # 运行期间 stdout 被 Tee 包裹
+        run.finish(status="crash", error="ValueError: boom")
+        self.assertIs(sys.stdout, old_out)     # 收尾后恢复
+        self.assertIs(sys.stderr, old_err)
+        with open(os.path.join(self.log_dir, RUN_INDEX_FILENAME), "r", encoding="utf-8") as f:
+            summary = json.loads(f.read().strip().splitlines()[-1])
+        self.assertEqual(summary["status"], "crash")
+        self.assertIn("ValueError: boom", summary["error"])
+
+    def test_cleaner_fills_stats(self):
+        from tencent_meeting.cleaner import run_cleaner
+        out = os.path.join(self._tmp.name, "downloads")
+        os.makedirs(os.path.join(out, "主题_id1"), exist_ok=True)
+        with open(os.path.join(out, "主题_id1", "video_id1.mp4"), "wb") as f:
+            f.write(b"x" * 16)
+        with open(os.path.join(out, "主题_id1", "transcript_id1.md"), "wb") as f:
+            f.write(b"t")
+        entry = new_entry("主题id1")
+        entry["transcript_done"] = True
+        entry["video"] = VIDEO_DONE
+        entry["audio"] = AUDIO_DONE
+        state = {"records": {"id1": entry}}
+        client = _FakeCleanClient([{"meeting_id": "m", "recording_id": "r", "detail_id": "id1",
+                                    "share_id": "", "uni_record_id": "9", "topic": "主题id1",
+                                    "record_type": "cloud_record", "has_video": True,
+                                    "is_shared_middle": False, "jump_path": "",
+                                    "allow_delete": True, "cloud_size": 100}])
+        stats = {}
+        rc = run_cleaner(client, state, out, ["md"], apply=False, stats=stats)
+        self.assertEqual(rc, 0)
+        self.assertEqual(stats, {"deletable": 1, "skipped": 0})
 
 
 if __name__ == "__main__":
