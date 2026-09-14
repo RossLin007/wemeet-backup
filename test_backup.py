@@ -47,7 +47,7 @@ class TestExpandMiddleContainers(unittest.TestCase):
     """回归：父合集只有在全部子记录备份完成后才能标记为完成容器。
 
     此前父记录在展开成功时即被标完成，导致增量运行跳过整个合集，
-    未完成视频的子记录（如 协同之舞-品德成功论_录制1）永远不会再被处理。
+    未完成视频的子记录永远不会再被处理。
     """
 
     PARENT = {"meeting_id": "", "recording_id": "", "share_id": "parentS",
